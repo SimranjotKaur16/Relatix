@@ -1,0 +1,44 @@
+{
+  "buildCommand": "yarn vercel-build",
+  "crons": [
+    {
+      "path": "/api/cron/lifecycle",
+      "schedule": "0 9 * * *"
+    },
+    {
+      "path": "/api/cron/billing-usage",
+      "schedule": "30 3 * * *"
+    },
+    {
+      "path": "/api/cron/reprocess-webhook-events",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/routines",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/record-deliveries",
+      "schedule": "*/5 * * * *"
+    }
+  ],
+  "git": {
+    "deploymentEnabled": true
+  },
+  "headers": [
+    {
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "application/json"
+        },
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=3600"
+        }
+      ],
+      "source": "/.well-known/microsoft-identity-association.json"
+    }
+  ],
+  "regions": ["fra1"]
+}
