@@ -1,0 +1,231 @@
+{
+  "$schema": "https://json.schemastore.org/eslintrc.json",
+  "env": {
+    "browser": false,
+    "es2021": true,
+    "node": true
+  },
+  "extends": [
+    "plugin:react/recommended",
+    "plugin:prettier/recommended",
+    "plugin:react-hooks/recommended",
+    "plugin:jsx-a11y/recommended",
+    "plugin:@next/next/recommended"
+  ],
+  "overrides": [
+    {
+      "files": ["**/*.mjs", "**/*.cjs"],
+      "parser": "espree",
+      "parserOptions": {
+        "ecmaVersion": 12,
+        "project": null,
+        "sourceType": "module"
+      }
+    },
+    {
+      "extends": [
+        "plugin:@typescript-eslint/recommended",
+        "plugin:@typescript-eslint/strict",
+        "plugin:@typescript-eslint/recommended-requiring-type-checking"
+      ],
+      "files": ["**/*.ts", "**/*.tsx"],
+      "plugins": ["better-tailwindcss"],
+      "rules": {
+        "@typescript-eslint/consistent-type-imports": "error",
+        "@typescript-eslint/no-explicit-any": "off",
+        "@typescript-eslint/no-unsafe-argument": "off",
+        "@typescript-eslint/no-unsafe-assignment": "off",
+        "@typescript-eslint/no-unsafe-call": "off",
+        "@typescript-eslint/no-unsafe-member-access": "off",
+        "@typescript-eslint/no-unsafe-return": "off",
+        "@typescript-eslint/no-unused-vars": [
+          "warn",
+          {
+            "args": "after-used",
+            "argsIgnorePattern": "^_.*?$",
+            "ignoreRestSiblings": false
+          }
+        ],
+        "better-tailwindcss/enforce-shorthand-classes": "warn",
+        "better-tailwindcss/no-conflicting-classes": "warn",
+        "better-tailwindcss/no-duplicate-classes": "warn",
+        "better-tailwindcss/no-unnecessary-whitespace": "warn",
+        "better-tailwindcss/no-unregistered-classes": "off"
+      },
+      "settings": {
+        "better-tailwindcss": {
+          "entryPoint": "styles/globals.css"
+        }
+      }
+    },
+    {
+      "files": ["components/entity-detail/hooks/use-entity-drawer-stack.ts"],
+      "rules": {
+        "no-restricted-imports": "off"
+      }
+    },
+    {
+      "files": [
+        "components/modal/app-modal.tsx",
+        "components/ui/command.tsx",
+        "components/ui/dialog.tsx",
+        "components/ui/drawer.tsx",
+        "components/ui/alert-dialog.tsx",
+        "components/ui/sheet.tsx",
+        "components/ui/popover.tsx",
+        "components/ui/dropdown-menu.tsx",
+        "components/ui/select.tsx",
+        "components/ui/tooltip.tsx"
+      ],
+      "rules": {
+        "no-restricted-imports": "off"
+      }
+    },
+    {
+      "files": ["components/shared/app-link.tsx"],
+      "rules": {
+        "no-restricted-imports": "off"
+      }
+    },
+    {
+      "files": [
+        "components/shared/locale-menu.tsx",
+        "**/settings/(account)/components/user.store.ts",
+        "**/subscription-expired-view.tsx",
+        "**/mcp-consent-card.tsx"
+      ],
+      "rules": {
+        "no-restricted-syntax": "off"
+      }
+    },
+    {
+      "files": ["**/*.json", "**/*.jsonc", "**/*.json5"],
+      "parser": "jsonc-eslint-parser",
+      "plugins": ["jsonc"],
+      "rules": {
+        "jsonc/sort-keys": [
+          "warn",
+          {
+            "order": {
+              "caseSensitive": false,
+              "natural": true,
+              "type": "asc"
+            },
+            "pathPattern": "^$"
+          },
+          {
+            "order": {
+              "caseSensitive": false,
+              "natural": true,
+              "type": "asc"
+            },
+            "pathPattern": ".*"
+          }
+        ]
+      }
+    }
+  ],
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "ecmaFeatures": {
+      "jsx": true
+    },
+    "ecmaVersion": 12,
+    "project": "./tsconfig.json",
+    "sourceType": "module",
+    "tsconfigRootDir": "."
+  },
+  "plugins": ["react", "unused-imports", "import", "@typescript-eslint", "jsx-a11y", "prettier"],
+  "rules": {
+    "curly": ["warn", "multi-or-nest"],
+    "jsx-a11y/click-events-have-key-events": "warn",
+    "jsx-a11y/interactive-supports-focus": "warn",
+    "jsx-a11y/no-autofocus": "off",
+    "no-console": "off",
+    "no-implicit-coercion": [
+      "error",
+      {
+        "boolean": true
+      }
+    ],
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "importNames": ["useRouter"],
+            "message": "Import useRouter from '@/i18n/navigation' so navigation flows through the unsaved-changes guard. The only exception is components/entity-detail/hooks/use-entity-drawer-stack.ts, which intentionally uses the raw router for drawer-stack query writes that do not change the page.",
+            "name": "next/navigation"
+          },
+          {
+            "message": "Use <AppModal> from '@/components/modal' so every modal shares the AppCard chrome, sizing, and unsaved-changes guard. The raw Dialog primitives are only allowed inside components/modal/app-modal.tsx (where AppModal wraps them) and components/ui/command.tsx (cmdk plumbing).",
+            "name": "@/components/ui/dialog"
+          },
+          {
+            "importNames": ["default"],
+            "message": "Use <AppLink> from '@/components/shared/app-link' for text links, or IntlLink from '@/i18n/navigation' inside styled or asChild wrappers, so internal links keep the active locale (next-intl localePrefix is 'always'). next/link's default Link export is only allowed in components/shared/app-link.tsx, the external-link wrapper; the named useLinkStatus hook is unaffected.",
+            "name": "next/link"
+          },
+          {
+            "importNames": ["Dialog", "AlertDialog", "Popover", "DropdownMenu", "Select", "Tooltip"],
+            "message": "Import overlay primitives from '@/components/ui/{dialog,alert-dialog,sheet,popover,dropdown-menu,select,tooltip}' so every overlay inherits the shared collision padding, available-width and available-height caps, dynamic-viewport budget and safe-area insets (CUS-60). Raw radix-ui overlay roots are only allowed inside those primitive files. Non-overlay primitives such as Slot, VisuallyHidden, Tabs and Accordion are unrestricted.",
+            "name": "radix-ui"
+          },
+          {
+            "message": "Import cmdk only inside components/ui/command.tsx. Anchored command surfaces compose Popover or CommandDialog rather than hand-rolling a floating list (CUS-60).",
+            "name": "cmdk"
+          },
+          {
+            "message": "Import Drawer from '@/components/ui/drawer' so it inherits the dynamic-viewport budget, scroll owner and safe-area insets (CUS-60). Raw vaul is only allowed inside components/ui/drawer.tsx.",
+            "name": "vaul"
+          }
+        ]
+      }
+    ],
+    "no-restricted-syntax": [
+      "error",
+      {
+        "message": "Call useTranslations() without a namespace and pass the full translation key. This keeps translation access consistent across shared components.",
+        "selector": "CallExpression[callee.name='useTranslations'][arguments.length>0]"
+      },
+      {
+        "message": "Avoid 'window.location.href = ...' \u2014 it bypasses the unsaved-changes guard. Either use the router from '@/i18n/navigation' or wrap the assignment in 'navigationGuard.tryNavigate(...)' (see components/shared/locale-menu.tsx for an example).",
+        "selector": "AssignmentExpression[left.object.object.name='window'][left.object.property.name='location'][left.property.name='href']"
+      }
+    ],
+    "no-unused-vars": "off",
+    "prettier/prettier": [
+      "warn",
+      {
+        "printWidth": 120
+      }
+    ],
+    "react/jsx-newline": [
+      "warn",
+      {
+        "prevent": false
+      }
+    ],
+    "react/jsx-sort-props": [
+      "warn",
+      {
+        "callbacksLast": true,
+        "noSortAlphabetically": false,
+        "reservedFirst": true,
+        "shorthandFirst": true
+      }
+    ],
+    "react/jsx-uses-react": "off",
+    "react/prop-types": "off",
+    "react/react-in-jsx-scope": "off",
+    "react/self-closing-comp": "warn",
+    "react-hooks/exhaustive-deps": "off",
+    "unused-imports/no-unused-imports": "warn",
+    "unused-imports/no-unused-vars": "off"
+  },
+  "settings": {
+    "react": {
+      "version": "detect"
+    }
+  }
+}
