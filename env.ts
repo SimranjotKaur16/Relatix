@@ -1,0 +1,87 @@
+import {
+  normalizeBaseUrl,
+  resolveAppMode,
+  resolveAuthAllowedHosts,
+  resolveBaseUrl,
+  resolveFileStorageDriver,
+  resolveOptionalBigInt,
+  resolveOptionalHttpUrl,
+  resolvePostalCodeDataUrl,
+  resolvePositiveInteger,
+  resolveStrictBoolean,
+} from "@/core/config/environment";
+
+const BASE_URL = resolveBaseUrl(process.env);
+const oauthProxyUrl = process.env.OAUTH_PROXY_URL?.trim();
+const oauthProxySecret = process.env.OAUTH_PROXY_SECRET?.trim() ? process.env.OAUTH_PROXY_SECRET : undefined;
+if (Boolean(oauthProxyUrl) !== Boolean(oauthProxySecret))
+  throw new Error("OAUTH_PROXY_URL and OAUTH_PROXY_SECRET must be configured together");
+
+export const env = {
+  DATABASE_URL: process.env.DATABASE_URL as string,
+  BETTER_AUTH_SECRET: process.env.BETTER_AUTH_SECRET as string,
+  BASE_URL,
+  AUTH_ALLOWED_HOSTS: resolveAuthAllowedHosts(process.env, BASE_URL),
+  OAUTH_PROXY_URL: oauthProxyUrl ? normalizeBaseUrl(oauthProxyUrl, "OAUTH_PROXY_URL") : undefined,
+  OAUTH_PROXY_SECRET: oauthProxySecret,
+
+  NODE_ENV: (process.env.NODE_ENV as "development" | "test" | "production" | undefined) ?? "development",
+  VERCEL_ENV: process.env.VERCEL_ENV as "development" | "preview" | "production" | undefined,
+  NEXT_RUNTIME: process.env.NEXT_RUNTIME as "nodejs" | "edge" | undefined,
+  CI: process.env.CI,
+
+  APP_MODE: resolveAppMode(process.env),
+  AGENT_CHAT_DISABLED: Boolean(process.env.AGENT_CHAT_DISABLED),
+  AI_GATEWAY_API_KEY: process.env.AI_GATEWAY_API_KEY,
+  HOSTED_AI_OPERATOR_CONTROLS_ENABLED: resolveStrictBoolean(
+    "HOSTED_AI_OPERATOR_CONTROLS_ENABLED",
+    process.env.HOSTED_AI_OPERATOR_CONTROLS_ENABLED,
+  ),
+  HOSTED_AI_PROVIDER_WORK_PAUSED: resolveStrictBoolean(
+    "HOSTED_AI_PROVIDER_WORK_PAUSED",
+    process.env.HOSTED_AI_PROVIDER_WORK_PAUSED,
+  ),
+  HOSTED_AI_MONTHLY_SPEND_CAP_MICROCENTS: resolveOptionalBigInt(
+    "HOSTED_AI_MONTHLY_SPEND_CAP_MICROCENTS",
+    process.env.HOSTED_AI_MONTHLY_SPEND_CAP_MICROCENTS,
+  ),
+
+  RESEND_API_KEY: process.env.RESEND_API_KEY,
+  RESEND_OPERATOR_EMAIL: process.env.RESEND_OPERATOR_EMAIL as string,
+
+  WORKFLOW_TARGET_WORLD: process.env.WORKFLOW_TARGET_WORLD,
+  CRON_SECRET: process.env.CRON_SECRET,
+
+  SENTRY_ORG: process.env.SENTRY_ORG,
+  SENTRY_PROJECT: process.env.SENTRY_PROJECT,
+  SENTRY_AUTH_TOKEN: process.env.SENTRY_AUTH_TOKEN,
+  NEXT_PUBLIC_SENTRY_DSN: process.env.NEXT_PUBLIC_SENTRY_DSN,
+
+  GOOGLE_CLIENT_ID: process.env.GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
+  AZURE_AD_CLIENT_ID: process.env.AZURE_AD_CLIENT_ID,
+  AZURE_AD_CLIENT_SECRET: process.env.AZURE_AD_CLIENT_SECRET,
+
+  LEMONSQUEEZY_API_KEY: process.env.LEMONSQUEEZY_API_KEY,
+  LEMONSQUEEZY_WEBHOOK_SECRET: process.env.LEMONSQUEEZY_WEBHOOK_SECRET,
+  LEMONSQUEEZY_STORE_ID: process.env.LEMONSQUEEZY_STORE_ID,
+  LEMONSQUEEZY_VARIANT_ID_STARTER: process.env.LEMONSQUEEZY_VARIANT_ID_STARTER,
+  LEMONSQUEEZY_VARIANT_ID_PRO: process.env.LEMONSQUEEZY_VARIANT_ID_PRO,
+  LEMONSQUEEZY_VARIANT_ID_BUSINESS: process.env.LEMONSQUEEZY_VARIANT_ID_BUSINESS,
+  LEMONSQUEEZY_VARIANT_ID_MAX: process.env.LEMONSQUEEZY_VARIANT_ID_MAX,
+
+  UNIPILE_API_KEY: process.env.UNIPILE_API_KEY,
+  UNIPILE_WEBHOOK_SECRET: process.env.UNIPILE_WEBHOOK_SECRET,
+  UNIPILE_HOSTED_AUTH_DOMAIN: process.env.UNIPILE_HOSTED_AUTH_DOMAIN,
+
+  FILE_STORAGE_DRIVER: resolveFileStorageDriver(process.env.FILE_STORAGE_DRIVER),
+  FILE_MAX_UPLOAD_BYTES: resolvePositiveInteger("FILE_MAX_UPLOAD_BYTES", process.env.FILE_MAX_UPLOAD_BYTES, 26214400),
+  S3_ENDPOINT: process.env.S3_ENDPOINT,
+  S3_REGION: process.env.S3_REGION,
+  S3_BUCKET: process.env.S3_BUCKET,
+  S3_ACCESS_KEY_ID: process.env.S3_ACCESS_KEY_ID,
+  S3_SECRET_ACCESS_KEY: process.env.S3_SECRET_ACCESS_KEY,
+  S3_FORCE_PATH_STYLE: resolveStrictBoolean("S3_FORCE_PATH_STYLE", process.env.S3_FORCE_PATH_STYLE),
+  ADDRESS_LOOKUP_URL: resolveOptionalHttpUrl("ADDRESS_LOOKUP_URL", process.env.ADDRESS_LOOKUP_URL),
+  POSTAL_CODE_DATA_URL: resolvePostalCodeDataUrl(process.env.POSTAL_CODE_DATA_URL),
+};
