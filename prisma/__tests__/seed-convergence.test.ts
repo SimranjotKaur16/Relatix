@@ -1,0 +1,157 @@
+import { randomUUID } from "node:crypto";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { describe, expect, it } from "vitest";
+import { PrismaClient } from "@/generated/prisma";
+import { getLocalDatabaseTestUrl } from "@/tests/helpers/database-test";
+import {
+  applyConfigurableRecordsMigration,
+  createLegacyMigrationDatabase,
+  LEGACY_CRM_TABLES,
+} from "@/tests/helpers/legacy-migration-database";
+import { createSeedContext, SEED_IDS } from "../seeds/context";
+import { runSyntheticSeed } from "../seeds/run";
+import { solutionWorkspacePlans } from "../seeds/solutions/seed-solutions";
+import { presetId } from "@/features/records/crm-preset";
+import { compareRecordKey } from "@/features/records/record-json";
+
+const database = getLocalDatabaseTestUrl();
+const suite = database ? describe : describe.skip;
+suite("generic synthetic seed convergence", { timeout: 180000 }, () => {
+  it("seeds twice after the configurable records migration, preserves recreated links and unrelated records, and removes only stale fixtures", async () => {
+    const fixture = await createLegacyMigrationDatabase(database);
+    let prisma: PrismaClient | undefined;
+    try {
+      await applyConfigurableRecordsMigration(fixture.client);
+      prisma = new PrismaClient({ adapter: new PrismaPg({ connectionString: fixture.url }) });
+      const context = createSeedContext(prisma, {
+        seedUserEmail: "max.bergmann@customermates.com",
+        sharedUserPassword: "synthetic-local-test",
+      });
+      const first = await runSyntheticSeed(context);
+      expect(first.workspaces).toHaveLength(18);
+      expect(first.workspaces.every((workspace) => workspace.created > 0 && workspace.updated === 0)).toBe(true);
+      const plans = solutionWorkspacePlans();
+      const team = plans.find(({ workspace }) => workspace.team);
+      if (!team) throw new Error("Missing the team workspace");
+      const companyId = SEED_IDS.company,
+        typeId = presetId(companyId, "contact");
+      const link = await prisma.recordLink.findFirstOrThrow({
+        where: { companyId, relationId: presetId(companyId, "contact.organizations") },
+      });
+      await prisma.recordLink.delete({
+        where: { companyId_relationId_id: { companyId, relationId: link.relationId, id: link.id } },
+      });
+      const replacementId = randomUUID();
+      await prisma.recordLink.create({ data: { ...link, id: replacementId } });
+      const unrelatedId = randomUUID(),
+        staleId = "60000000-0000-4000-8000-999999999999";
+      await prisma.crmRecord.createMany({ data: [unrelatedId, staleId].map((id) => ({ companyId, typeId, id })) });
+      const counts = {
+        fields: await prisma.recordFieldDefinition.count({ where: { companyId } }),
+        links: await prisma.recordLink.count({ where: { companyId } }),
+        histories: await prisma.eventLog.count({ where: { companyId } }),
+        deliveries: await prisma.webhookDelivery.count({ where: { companyId } }),
+      };
+      const second = await runSyntheticSeed(context);
+      expect(second.reset).toEqual([]);
+      expect(second.workspaces.filter((workspace) => workspace.slug !== team.workspace.slug)).toEqual(
+        first.workspaces
+          .filter((workspace) => workspace.slug !== team.workspace.slug)
+          .map((workspace) => ({
+            ...workspace,
+            created: 0,
+            updated: 0,
+            deleted: 0,
+            unchanged: workspace.created,
+            durationMs: expect.any(Number),
+          })),
+      );
+      expect(second.workspaces.find((workspace) => workspace.slug === team.workspace.slug)).toMatchObject({
+        created: 0,
+        updated: 0,
+        deleted: 1,
+      });
+      expect(
+        await prisma.crmRecord.findUnique({ where: { companyId_typeId_id: { companyId, typeId, id: unrelatedId } } }),
+      ).not.toBeNull();
+      expect(
+        await prisma.crmRecord.findUnique({ where: { companyId_typeId_id: { companyId, typeId, id: staleId } } }),
+      ).toBeNull();
+      expect(
+        await prisma.recordLink.findUnique({
+          where: { companyId_relationId_id: { companyId, relationId: link.relationId, id: replacementId } },
+        }),
+      ).not.toBeNull();
+      expect(await prisma.recordFieldDefinition.count({ where: { companyId } })).toBe(counts.fields);
+      expect(await prisma.recordLink.count({ where: { companyId } })).toBe(counts.links);
+      expect(await prisma.eventLog.count({ where: { companyId } })).toBe(counts.histories);
+      expect(await prisma.webhookDelivery.count({ where: { companyId } })).toBe(counts.deliveries);
+      for (const kind of ["contact", "organization", "deal", "service", "task"] as const) {
+        // Records in Trash (the seeded Trash fixtures) are not part of the live lists.
+        expect(
+          await prisma.crmRecord.count({ where: { companyId, typeId: presetId(companyId, kind), deletedAt: null } }),
+        ).toBe((team.content.records[kind]?.length ?? 0) + (kind === "contact" ? 1 : 0));
+      }
+
+      const secondWorkspace = SEED_IDS.secondWorkspaceCompany;
+      const owner = await prisma.user.findUniqueOrThrow({ where: { id: SEED_IDS.user }, select: { email: true } });
+      const memberships = await prisma.user.findMany({
+        where: { email: owner.email },
+        select: {
+          companyId: true,
+          status: true,
+          company: { select: { name: true } },
+          role: { select: { isSystemRole: true } },
+        },
+      });
+      expect(memberships.toSorted((a, b) => compareRecordKey(a.companyId, b.companyId))).toEqual(
+        plans
+          .map(({ workspace, content }) => ({
+            companyId: workspace.companyId,
+            status: "active",
+            company: { name: content.workspaceName },
+            role: { isSystemRole: true },
+          }))
+          .toSorted((a, b) => compareRecordKey(a.companyId, b.companyId)),
+      );
+      expect(memberships.some(({ company }) => /Northwind|Bergmann Steuern/.test(company.name ?? ""))).toBe(false);
+      expect(await prisma.userRole.count({ where: { companyId: secondWorkspace } })).toBe(1);
+      expect(await prisma.recordSchemaState.count({ where: { companyId: secondWorkspace } })).toBe(1);
+      expect(await prisma.recordTypeDefinition.count({ where: { companyId: secondWorkspace } })).toBeGreaterThan(0);
+      expect(
+        await prisma.subscription.findUniqueOrThrow({
+          where: { companyId: secondWorkspace },
+          select: { status: true },
+        }),
+      ).toEqual({ status: "active" });
+      expect(
+        await prisma.p13n.count({
+          where: { companyId: { in: plans.map(({ workspace }) => workspace.companyId) }, p13nId: "sidebar" },
+        }),
+      ).toBe(0);
+
+      const hooks = await prisma.webhook.findMany({ where: { companyId } });
+      expect(
+        hooks.every((hook) => hook.events.every((event) => !/^(contact|organization|deal|service|task)\./.test(event))),
+      ).toBe(true);
+      const routines = await prisma.routine.findMany({ where: { companyId } });
+      expect(
+        routines.every((routine) =>
+          routine.triggerEvents.every((event) => !/^(contact|organization|deal|service|task)\./.test(event)),
+        ),
+      ).toBe(true);
+      expect(await prisma.recordEventSubscription.count({ where: { companyId } })).toBeGreaterThan(0);
+      expect(
+        (
+          await fixture.client.query(
+            "SELECT name,to_regclass(format('%I',name)) AS table FROM unnest($1::text[]) name",
+            [LEGACY_CRM_TABLES],
+          )
+        ).rows.every((row) => row.table === null),
+      ).toBe(true);
+    } finally {
+      await prisma?.$disconnect();
+      await fixture.close();
+    }
+  });
+});
