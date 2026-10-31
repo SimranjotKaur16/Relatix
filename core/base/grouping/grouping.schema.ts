@@ -1,0 +1,119 @@
+import type { ChipColor } from "@/constants/chip-colors";
+import type { Data } from "@/core/validation/validation.utils";
+import type { GroupingKind } from "./groupable-field";
+import type { RecordGroupSummaryResult } from "@/features/records/record-grouping.schema";
+
+import { z } from "zod";
+
+export const DATE_BUCKETS = ["day", "week", "month"] as const;
+const DateBucketSchema = z.enum(DATE_BUCKETS);
+export type DateBucket = Data<typeof DateBucketSchema>;
+export const DEFAULT_DATE_BUCKET: DateBucket = "month";
+
+export const MAX_AXIS_GROUPS = 50;
+export const MAX_GROUP_SUMMARIES = 8;
+export const GROUP_SUMMARY_AGGREGATIONS = ["sum", "average", "min", "max"] as const;
+
+export const GroupSummaryDefinitionSchema = z
+  .object({
+    fieldId: z.uuid(),
+    aggregation: z.enum(GROUP_SUMMARY_AGGREGATIONS),
+  })
+  .strict();
+export type GroupSummaryDefinition = Data<typeof GroupSummaryDefinitionSchema>;
+
+export const GroupingSchema = z.object({
+  field: z.string().min(1).max(200),
+  bucket: DateBucketSchema.optional(),
+  hidden: z
+    .array(z.string().min(1).max(256))
+    .max(MAX_AXIS_GROUPS)
+    .optional()
+    .describe("Group keys the board hides (value:<optionId> or __empty__); Appearance lists them to show again."),
+  hideEmpty: z.boolean().optional().describe("The board hides columns without records."),
+  summaries: z
+    .array(GroupSummaryDefinitionSchema)
+    .max(MAX_GROUP_SUMMARIES)
+    .optional()
+    .describe(
+      "Totals shown on each table group and board column: a number or currency field of the list with sum, average, min or max. Each pair at most once.",
+    ),
+});
+export type Grouping = Data<typeof GroupingSchema>;
+
+export const NO_VALUE_GROUP_KEY = "__empty__";
+export const GROUP_PAGE_SIZE_DEFAULT = 10;
+export const GROUP_PAGE_SIZE_MAX = 500;
+export const MAX_MATERIALISED_GROUPS = 25;
+
+export const GroupPageRequestSchema = z.object({
+  perGroup: z.number().int().min(1).max(GROUP_PAGE_SIZE_MAX).optional(),
+  overrides: z.record(z.string(), z.number().int().min(1).max(GROUP_PAGE_SIZE_MAX)).optional(),
+  collapsed: z.array(z.string().max(256)).max(MAX_AXIS_GROUPS).optional(),
+  only: z.string().max(256).optional(),
+});
+export type GroupPageRequest = Data<typeof GroupPageRequestSchema>;
+
+type GroupLabelKind = "value" | "noValue" | "unavailable";
+
+export type GroupOverflow = { shown: number; withRecords: boolean };
+
+export type DataViewGroup = {
+  key: string;
+  count: number;
+  labelKind: GroupLabelKind;
+  label?: string;
+  labelKey?: string;
+  color?: ChipColor;
+  weight?: number;
+  avatarUrl?: string | null;
+  bucketStart?: string;
+  bucketRole?: "window" | "earlier" | "later";
+  isNoValue: boolean;
+  materialised: boolean;
+  itemIds: string[];
+  hasMore: boolean;
+  writable?: boolean;
+  summaries?: RecordGroupSummaryResult[];
+};
+
+export type GroupingResult = {
+  timeZone?: "UTC";
+  grouping: Grouping;
+  kind: GroupingKind;
+  supportsDragWriteBack: boolean;
+  columnId?: string;
+  groups: DataViewGroup[];
+  total: number;
+  membershipTotal?: number;
+  overflow?: GroupOverflow;
+  partial?: boolean;
+};
+
+export function groupingForField(field: string | null | undefined): Grouping | null | undefined {
+  if (field === undefined) return undefined;
+
+  return field ? { field } : null;
+}
+
+export function encodeGroupingToken(grouping: Grouping): string {
+  return grouping.bucket ? `${grouping.field}:${grouping.bucket}` : grouping.field;
+}
+
+export function decodeGroupingToken(token: string | null | undefined): Grouping | undefined {
+  if (!token) return undefined;
+
+  const separator = token.lastIndexOf(":");
+  const head = separator === -1 ? token : token.slice(0, separator);
+  const tail = separator === -1 ? undefined : token.slice(separator + 1);
+  const bucket = DateBucketSchema.safeParse(tail);
+  const parsed = GroupingSchema.safeParse(bucket.success ? { field: head, bucket: bucket.data } : { field: token });
+
+  return parsed.success ? parsed.data : undefined;
+}
+
+export function sameGrouping(left: Grouping | null | undefined, right: Grouping | null | undefined): boolean {
+  if (!left || !right) return !left && !right;
+
+  return left.field === right.field && left.bucket === right.bucket;
+}
