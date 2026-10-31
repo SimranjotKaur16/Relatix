@@ -1,0 +1,141 @@
+import { TestQueryBuilder } from "./fixtures/multiple-filters-per-field-test-query-builder";
+import type { RootStore } from "@/core/stores/root.store";
+import type { GetResult } from "../base-get.interactor";
+import type { Filter, FilterableField, GetQueryParams } from "../base-get.schema";
+
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }));
+vi.mock("@/app/actions", () => ({
+  saveDataViewStateAction: vi.fn(),
+  selectDataViewAction: vi.fn(),
+  bulkDeleteEntitiesAction: vi.fn(),
+}));
+
+import { ALL_VIEW_KEY, SURFACE } from "@/core/data-view/data-view-keys";
+import { FilterFieldKey } from "@/core/types/filter-field-key";
+import { decodeGetParams, encodeGetParams } from "@/core/utils/get-params";
+import { BaseDataViewStore } from "../base-data-view.store";
+import { defaultValidateFilters, FilterOperatorKey, ViewMode } from "../base-query-builder";
+
+type Item = { id: string };
+
+const FILTERABLE_FIELDS: FilterableField[] = [
+  {
+    field: FilterFieldKey.status,
+    operators: [FilterOperatorKey.in, FilterOperatorKey.notIn],
+  },
+];
+
+TestQueryBuilder.filterableFields = FILTERABLE_FIELDS;
+
+const statusFilter = (value: string): Filter =>
+  ({
+    field: FilterFieldKey.status,
+    operator: FilterOperatorKey.in,
+    value: [value],
+  }) as Filter;
+
+class TestStore extends BaseDataViewStore<Item> {
+  get columnsDefinition() {
+    return [{ uid: "name" }, { uid: "status" }];
+  }
+
+  protected refreshAction(params?: GetQueryParams): Promise<GetResult<Item>> {
+    return Promise.resolve(serverEcho(params));
+  }
+}
+
+function serverEcho(params?: GetQueryParams): GetResult<Item> {
+  return {
+    items: [],
+    p13nId: SURFACE.routines,
+    filterableFields: FILTERABLE_FIELDS,
+    filters: params?.filters ?? [],
+    searchTerm: params?.searchTerm,
+    sortDescriptor: params?.sortDescriptor,
+    pagination: { page: 1, pageSize: 25, total: 1, totalPages: 1 },
+    views: [],
+    activeViewKey: ALL_VIEW_KEY,
+    viewPersistable: false,
+    viewMode: ViewMode.table,
+  };
+}
+
+function hydrated(filters: Filter[] = []): TestStore {
+  const root = {
+    loadingOverlayStore: { isLoading: false },
+    localeStore: { getTranslation: (key: string) => key },
+  } as unknown as RootStore;
+  const store = new TestStore(root);
+  store.setItems(serverEcho({ filters }));
+
+  return store;
+}
+
+const andEntries = (where: Record<string, unknown>) => (where.AND ?? []) as Record<string, unknown>[];
+
+describe("two filters on one field", () => {
+  it("survives server validation as two separate candidates", () => {
+    const filters = [statusFilter("open"), statusFilter("won")];
+
+    expect(defaultValidateFilters({ filters, filterableFields: FILTERABLE_FIELDS })).toEqual(filters);
+  });
+
+  it("becomes two separate AND clauses on a scalar field", async () => {
+    const { where } = await new TestQueryBuilder().buildQueryArgs({
+      filters: [statusFilter("open"), statusFilter("won")],
+    });
+
+    expect(andEntries(where)).toEqual([{ status: { in: ["open"] } }, { status: { in: ["won"] } }]);
+  });
+
+  it("round-trips through the URL in order", () => {
+    const filters = [statusFilter("open"), statusFilter("won")];
+    const encoded = encodeGetParams({ filters });
+
+    expect(encoded.getAll("filters")).toEqual(["status:in:open", "status:in:won"]);
+    expect(decodeGetParams(encoded).filters).toEqual(filters);
+  });
+});
+
+describe("index addressed filter actions", () => {
+  it("appends rather than merging by field", () => {
+    const store = hydrated([statusFilter("open")]);
+
+    store.appendFilter(statusFilter("won"));
+
+    expect(store.filters).toEqual([statusFilter("open"), statusFilter("won")]);
+  });
+
+  it("removes one row and leaves its sibling on the same field in place", () => {
+    const store = hydrated([statusFilter("open"), statusFilter("won")]);
+
+    store.removeFilterAt(0);
+
+    expect(store.filters).toEqual([statusFilter("won")]);
+  });
+
+  it("replaces in place without disturbing the order", () => {
+    const store = hydrated([statusFilter("open"), statusFilter("won")]);
+
+    store.replaceFilterAt(0, statusFilter("lost"));
+
+    expect(store.filters).toEqual([statusFilter("lost"), statusFilter("won")]);
+  });
+
+  it("ignores an index that no longer exists", () => {
+    const store = hydrated([statusFilter("open")]);
+
+    store.removeFilterAt(4);
+    store.replaceFilterAt(-1, statusFilter("won"));
+
+    expect(store.filters).toEqual([statusFilter("open")]);
+  });
+
+  it("offers no field-keyed removal that would drop every sibling", () => {
+    const store = hydrated([statusFilter("open")]);
+
+    expect("removeFilter" in store).toBe(false);
+  });
+});
