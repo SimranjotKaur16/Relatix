@@ -1,0 +1,1827 @@
+import type { GetQueryParams } from "@/core/base/base-get.schema";
+import type { GroupableFieldDto } from "@/core/base/grouping/groupable-field";
+import type {
+  GroupPageRequest,
+  GroupSummaryDefinition,
+  Grouping,
+  GroupingResult,
+} from "@/core/base/grouping/grouping.schema";
+import type { ColumnPresentation } from "@/core/data-view/column-presentation.schema";
+import type { CalendarViewConfig } from "@/core/data-view/calendar-view-config.schema";
+import type { DataViewSurfaceKey } from "@/core/data-view/data-view-keys";
+import type { DataViewChipDto, DataViewState } from "@/core/data-view/data-view-state.schema";
+import { isPersistedColumnWidthKey } from "@/core/data-view/data-view-state.schema";
+import type { ObservableSet } from "mobx";
+import type { RootStore } from "../stores/root.store";
+import type { GetResult } from "./base-get.interactor";
+import type { Filter, FilterableField, PaginationRequest, SortDescriptor } from "./base-get.schema";
+
+import deepEqual from "fast-deep-equal/es6";
+import { action, computed, makeObservable, observable, runInAction, toJS } from "mobx";
+
+import type { Resource } from "@/generated/prisma";
+import { Action } from "@/generated/prisma";
+
+import { reportApplicationError } from "../errors/report-application-error";
+import { notifyIfWorkspaceChanged } from "../errors/workspace-changed-notice";
+import { ForbiddenError } from "../errors/app-errors";
+import { toastZodErrorTree } from "../utils/toast-zod-error-tree";
+
+import { ViewMode } from "./base-query-builder";
+import { BaseStore } from "./base.store";
+
+import { saveDataViewStateAction, selectDataViewAction, upsertDataViewAction } from "@/app/actions";
+import {
+  GROUP_PAGE_SIZE_DEFAULT,
+  MAX_AXIS_GROUPS,
+  encodeGroupingToken,
+  sameGrouping,
+} from "@/core/base/grouping/grouping.schema";
+import { ALL_VIEW_KEY } from "@/core/data-view/data-view-keys";
+import type { DataViewProposal } from "@/core/data-view/data-view-proposal.schema";
+import type { SharedView } from "@/core/data-view/shared-view-link";
+import { scopeSharedViewState } from "@/core/data-view/shared-view-link";
+import {
+  type ViewDraft,
+  draftStorageKey,
+  mergeProposalDraft,
+  parseViewDraft,
+  proposalViewKey,
+  viewQueryDraftOwner,
+} from "@/core/data-view/view-query-drafts";
+import { reserveViewStateWrite, type ViewStateWriteIntent } from "@/core/data-view/view-state-persistence";
+
+export const MAX_SELECTION_SIZE = 100;
+
+export interface HasId {
+  id: string;
+}
+
+export type TableColumn = {
+  uid: string;
+  sortable?: boolean;
+  label?: string;
+  width?: number;
+};
+
+export type DataViewRequestState =
+  | { readonly status: "uninitialized" }
+  | { readonly status: "ready" }
+  | { readonly status: "refreshing" }
+  | { readonly status: "refresh-error"; readonly error: unknown };
+
+type DataViewRefreshMode = "background" | "visible";
+
+type SelectionScope = { filters: Filter[]; searchTerm: string | null };
+
+type ViewQuery = { filters: Filter[]; searchTerm: string | undefined };
+
+type ViewProposalStatus = { name?: string; isNew: boolean };
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function filterSignature(filters: Filter[]): string[] {
+  return filters.map(canonicalJson).sort();
+}
+
+export type CalendarFieldChoice = { id: string; label: string };
+export type CalendarFieldOptions = {
+  dates: CalendarFieldChoice[];
+  endsFor: (dateFieldId: string) => CalendarFieldChoice[];
+  colors: CalendarFieldChoice[];
+};
+
+const APPEARANCE_KEYS = [
+  "sortDescriptor",
+  "pageSize",
+  "viewMode",
+  "grouping",
+  "columnOrder",
+  "hiddenColumns",
+  "calendar",
+] as const;
+
+type AppearanceKey = (typeof APPEARANCE_KEYS)[number];
+
+const URL_CARRIED_APPEARANCE_KEYS = new Set<AppearanceKey>(["sortDescriptor", "pageSize", "viewMode", "grouping"]);
+
+function appearanceSignature(key: AppearanceKey, state: DataViewState | undefined): string {
+  switch (key) {
+    case "sortDescriptor": {
+      const sort = state?.sortDescriptor;
+      return canonicalJson(sort ? { field: sort.field, direction: sort.direction } : null);
+    }
+    case "pageSize":
+      return canonicalJson(state?.pageSize ?? null);
+    case "viewMode":
+      return canonicalJson(state?.viewMode ?? ViewMode.table);
+    case "grouping": {
+      const grouping = state?.grouping;
+      return canonicalJson(
+        grouping
+          ? {
+              field: grouping.field,
+              bucket: grouping.bucket ?? null,
+              hidden: [...(grouping.hidden ?? [])].sort(),
+              hideEmpty: Boolean(grouping.hideEmpty),
+              summaries: (grouping.summaries ?? []).map(canonicalJson),
+            }
+          : null,
+      );
+    }
+    case "columnOrder":
+      return canonicalJson(state?.columnOrder ?? []);
+    case "hiddenColumns":
+      return canonicalJson([...(state?.hiddenColumns ?? [])].sort());
+    case "calendar": {
+      const calendar = state?.calendar;
+      return canonicalJson(
+        calendar
+          ? {
+              dateFieldId: calendar.dateFieldId,
+              endDateFieldId: calendar.endDateFieldId ?? null,
+              colorFieldId: calendar.colorFieldId ?? null,
+              mode: calendar.mode ?? "month",
+            }
+          : null,
+      );
+    }
+  }
+}
+
+function sameAppearanceValue(key: AppearanceKey, left: DataViewState | undefined, right: DataViewState | undefined) {
+  return appearanceSignature(key, left) === appearanceSignature(key, right);
+}
+
+export abstract class BaseDataViewStore<Entity extends HasId> extends BaseStore {
+  items: Entity[] = [];
+
+  searchTerm: string | undefined;
+  pagination: (PaginationRequest & { totalPages?: number; total?: number }) | undefined;
+  sortDescriptor: SortDescriptor | undefined;
+  filters: Filter[] | undefined = undefined;
+  filterableFields: FilterableField[] = [];
+
+  p13nId?: string;
+  resetLayout?: () => Promise<void>;
+  columnOrder: string[] = [];
+  columnWidths: Record<string, number> = {};
+  hiddenColumns: string[] = [];
+  views: DataViewChipDto[] = [];
+  allViewState: DataViewState = {};
+  activeViewKey: string = ALL_VIEW_KEY;
+  viewPersistable = true;
+  viewMode: ViewMode = ViewMode.table;
+  calendar?: CalendarViewConfig | null;
+  grouping?: Grouping | null;
+  groupingResult?: GroupingResult;
+  groupableFields: GroupableFieldDto[] = [];
+  collapsedGroupKeys: ObservableSet<string> = observable.set();
+  expandedEmptyGroupKeys: ObservableSet<string> = observable.set();
+  selectedIds: ObservableSet<string> = observable.set();
+  selectedScope: SelectionScope | undefined = undefined;
+
+  groupCounts: Record<string, number> = {};
+  groupedTakeOverrides: Record<string, number> = {};
+
+  public readonly resource?: Resource;
+
+  private persistViewStateTimer?: number;
+  private queryDraftRestored = false;
+  proposal: ViewProposalStatus | null = null;
+  savedAppearance: DataViewState | undefined = undefined;
+  private resolvingSavedView = false;
+  private pendingViewStateIntent?: ViewStateWriteIntent;
+  private pendingGroupOnly?: string;
+  private requestGeneration = 0;
+  private viewStateWrites = new Map<string, number>();
+  private viewStateWriteSeq = 0;
+  private backgroundRefreshRunning = false;
+  private backgroundRefreshQueued = false;
+  private requestState: DataViewRequestState = { status: "uninitialized" };
+  private onChangesCallbacks: (() => void | Promise<void>)[] = [];
+  private saveAsViewOpener?: () => void;
+
+  schemaSettingsHref?: string;
+  viewPathname?: string;
+  viewSyncToUrl = true;
+  get supportsSelection(): boolean {
+    return false;
+  }
+  get supportsBoard(): boolean {
+    return false;
+  }
+  get calendarFieldIds(): ReadonlySet<string> | undefined {
+    return undefined;
+  }
+  get supportsCalendar(): boolean {
+    return false;
+  }
+  get canCalendar(): boolean {
+    return false;
+  }
+  get defaultCalendar(): CalendarViewConfig | null {
+    return null;
+  }
+  get calendarFieldOptions(): CalendarFieldOptions | null {
+    return null;
+  }
+  get sharesViewState(): boolean {
+    return true;
+  }
+  get supportsManualOrder(): boolean {
+    return false;
+  }
+  get recordPictureFieldId(): string | undefined {
+    return undefined;
+  }
+  get recordLabels(): { singular: string; plural: string } | undefined {
+    return undefined;
+  }
+  get viewTypeLabel(): string | undefined {
+    return undefined;
+  }
+
+  get manualOrderActive(): boolean {
+    return false;
+  }
+
+  async moveItemBetweenGroups(_params: {
+    item: Entity;
+    optimisticItem: Entity;
+    fromGroupKey: string;
+    toGroupKey: string;
+    value: string | null;
+    afterId?: string | null;
+    beforeId?: string | null;
+  }): Promise<void> {}
+
+  moveInGrouping = (
+    itemId: string,
+    fromGroupKey: string,
+    toGroupKey: string,
+    beforeId: string | null,
+  ): GroupingResult | undefined => {
+    const current = this.groupingResult;
+    if (!current) return undefined;
+    const crossing = fromGroupKey !== toGroupKey;
+    this.groupingResult = {
+      ...current,
+      groups: current.groups.map((group) => {
+        const ids = group.itemIds.filter((id) => id !== itemId);
+        if (group.key !== toGroupKey) {
+          return group.key === fromGroupKey && crossing
+            ? { ...group, itemIds: ids, count: Math.max(0, group.count - 1) }
+            : group;
+        }
+        const at = beforeId ? ids.indexOf(beforeId) : -1;
+        return {
+          ...group,
+          itemIds: at < 0 ? [...ids, itemId] : [...ids.slice(0, at), itemId, ...ids.slice(at)],
+          count: group.count + (crossing ? 1 : 0),
+        };
+      }),
+    };
+    return current;
+  };
+
+  restoreGrouping = (snapshot: GroupingResult): void => {
+    this.groupingResult = snapshot;
+  };
+
+  abstract get columnsDefinition(): TableColumn[];
+
+  get primaryColumnId(): string | undefined {
+    return "name";
+  }
+
+  get differsFromDefaultLayout(): boolean {
+    return false;
+  }
+
+  get summaryFields(): { id: string; label: string }[] {
+    return [];
+  }
+
+  constructor(rootStore: RootStore, resource?: Resource) {
+    super(rootStore);
+    this.resource = resource;
+
+    makeObservable<this, "requestState">(this, {
+      requestState: observable.ref,
+      dataRequest: computed,
+      isRefreshing: computed,
+      isReady: computed,
+
+      items: observable,
+
+      searchTerm: observable,
+      filters: observable,
+      filterableFields: observable,
+      pagination: observable,
+      sortDescriptor: observable,
+
+      p13nId: observable,
+      hiddenColumns: observable,
+      columnOrder: observable,
+      columnWidths: observable,
+      views: observable,
+      allViewState: observable,
+      activeViewKey: observable,
+      viewPersistable: observable,
+      viewMode: observable,
+      calendar: observable.ref,
+      grouping: observable,
+      groupingResult: observable.ref,
+      groupableFields: observable,
+      collapsedGroupKeys: observable,
+      expandedEmptyGroupKeys: observable,
+      selectedIds: observable,
+      selectedScope: observable.ref,
+
+      groupCounts: observable,
+      groupedTakeOverrides: observable,
+
+      proposal: observable.ref,
+      savedAppearance: observable.ref,
+      savedQuery: computed,
+      canSaveQuery: computed,
+      canSaveViewChanges: computed,
+      canSaveAsView: computed,
+      isFilterModified: computed,
+      isAppearanceModified: computed,
+      isViewModified: computed,
+      filterColumns: computed,
+      orderedColumns: computed,
+      visibleColumns: computed,
+      sortableColumnIds: computed,
+      canManage: computed,
+      canExport: computed,
+      isDisabled: computed,
+      hasSelection: computed,
+      selectedCount: computed,
+      selectedVisibleCount: computed,
+      selectedOffViewCount: computed,
+      isSelectionAtLimit: computed,
+      currentSelectionScope: computed,
+      isSelectionScopeStale: computed,
+      canBoard: computed,
+      isGrouped: computed,
+      groupingKey: computed,
+      currentGroupableFieldId: computed,
+
+      setViewOptions: action,
+      setQueryOptions: action,
+      appendFilter: action,
+      replaceFilterAt: action,
+      removeFilterAt: action,
+      applyView: action,
+      saveViewChanges: action,
+      applyViewProposal: action,
+      applySharedView: action,
+      resetViewChanges: action,
+      restoreQueryDraft: action,
+      refresh: action,
+      upsertItem: action,
+      upsertItemLocal: action,
+      removeItem: action,
+      registerOnChange: action,
+      executeOnChanges: action,
+      setItems: action,
+      setSelectedIds: action,
+      toggleItemSelection: action,
+      setPageSelection: action,
+      keepSelectionInView: action,
+      clearSelection: action,
+      loadMoreInGroup: action,
+      toggleGroupCollapsed: action,
+      moveInGrouping: action,
+      restoreGrouping: action,
+      toggleBoardStrip: action,
+      hideGroup: action,
+      showGroup: action,
+      setHideEmptyGroups: action,
+      setGroupSummaries: action,
+      setGroupSelection: action,
+      resetGroupedTakeOverrides: action,
+    });
+  }
+
+  get isReady(): boolean {
+    return this.requestState.status !== "uninitialized";
+  }
+
+  get dataRequest(): DataViewRequestState {
+    return this.requestState;
+  }
+
+  get isRefreshing(): boolean {
+    return this.requestState.status === "refreshing";
+  }
+
+  get savedQuery(): ViewQuery {
+    const saved = this.views.find((view) => view.id === this.activeViewKey)?.state ?? this.allViewState;
+    return {
+      filters: this.withKnownFields(saved.filters),
+      searchTerm: saved.searchTerm || undefined,
+    };
+  }
+
+  get canSaveQuery(): boolean {
+    return Boolean(this.p13nId) && this.viewPersistable && this.canPersistViewState();
+  }
+
+  get isFilterModified(): boolean {
+    if (!this.isReady || !this.canSaveQuery) return false;
+
+    return !deepEqual(filterSignature(toJS(this.filters) ?? []), filterSignature(this.savedQuery.filters));
+  }
+
+  get isAppearanceModified(): boolean {
+    if (!this.isReady || !this.canSaveQuery || !this.savedAppearance) return false;
+    const current = this.currentAppearance();
+
+    return APPEARANCE_KEYS.some((key) => !sameAppearanceValue(key, current, this.savedAppearance));
+  }
+
+  get isViewModified(): boolean {
+    if (!this.isReady || !this.canSaveQuery) return false;
+    if (this.proposal) return true;
+
+    return this.isFilterModified || this.isAppearanceModified;
+  }
+
+  get canSaveViewChanges(): boolean {
+    if (!this.isViewModified) return false;
+    if (this.proposal) return !this.proposal.isNew || Boolean(this.proposal.name);
+
+    return true;
+  }
+
+  get canSaveAsView(): boolean {
+    if (!this.isReady || !this.canSaveQuery || this.activeViewKey !== ALL_VIEW_KEY) return false;
+    if (this.proposal) return this.proposal.isNew && !this.proposal.name;
+
+    return this.isFilterModified || this.hasSessionSearch;
+  }
+
+  registerSaveAsView = (opener: () => void): (() => void) => {
+    this.saveAsViewOpener = opener;
+
+    return () => {
+      if (this.saveAsViewOpener === opener) this.saveAsViewOpener = undefined;
+    };
+  };
+
+  openSaveAsView = (): void => {
+    this.saveAsViewOpener?.();
+  };
+
+  private get hasSessionQuery(): boolean {
+    if (!this.isReady || !this.canSaveQuery) return false;
+
+    return this.isViewModified || this.hasSessionSearch;
+  }
+
+  private get hasSessionSearch(): boolean {
+    return (this.searchTerm || undefined) !== this.savedQuery.searchTerm;
+  }
+
+  private get savedViewState(): DataViewState {
+    return this.views.find((view) => view.id === this.activeViewKey)?.state ?? this.allViewState;
+  }
+
+  currentAppearance = (): DataViewState => ({
+    sortDescriptor: toJS(this.sortDescriptor) ?? null,
+    ...(this.pagination ? { pageSize: this.pagination.pageSize as DataViewState["pageSize"] } : {}),
+    viewMode: toJS(this.viewMode),
+    grouping: toJS(this.grouping) ?? null,
+    columnOrder: toJS(this.columnOrder),
+    hiddenColumns: toJS(this.hiddenColumns),
+    calendar: this.calendar ?? null,
+  });
+
+  viewStateSnapshot = ({ includeQuery }: { includeQuery: boolean }): DataViewState => {
+    const saved = this.savedQuery;
+    if (!includeQuery) {
+      return {
+        ...toJS(this.savedViewState),
+        filters: saved.filters,
+        searchTerm: saved.searchTerm ?? "",
+        columnWidths: toJS(this.columnWidths),
+      };
+    }
+
+    return {
+      filters: toJS(this.filters) ?? [],
+      searchTerm: saved.searchTerm ?? "",
+      sortDescriptor: toJS(this.sortDescriptor) ?? null,
+      pageSize: this.pagination?.pageSize,
+      viewMode: toJS(this.viewMode),
+      grouping: toJS(this.grouping) ?? null,
+      columnOrder: toJS(this.columnOrder),
+      columnWidths: toJS(this.columnWidths),
+      hiddenColumns: toJS(this.hiddenColumns),
+      calendar: this.calendar ?? null,
+    };
+  };
+
+  private applyAppearance(appearance: DataViewState): void {
+    const groupingBefore = this.groupingKey;
+    if ("sortDescriptor" in appearance) this.sortDescriptor = appearance.sortDescriptor ?? undefined;
+    if (appearance.pageSize && this.pagination) this.pagination = { ...this.pagination, pageSize: appearance.pageSize };
+    if ("viewMode" in appearance) this.viewMode = appearance.viewMode ?? ViewMode.table;
+    if ("grouping" in appearance) this.grouping = appearance.grouping ?? null;
+    if (appearance.columnOrder) this.columnOrder = appearance.columnOrder.filter((uid) => uid !== this.primaryColumnId);
+    if (appearance.hiddenColumns)
+      this.hiddenColumns = appearance.hiddenColumns.filter((uid) => uid !== this.primaryColumnId);
+    if ("calendar" in appearance) this.calendar = appearance.calendar ?? null;
+    if (groupingBefore === this.groupingKey) return;
+    this.resetGroupedTakeOverrides();
+    this.collapsedGroupKeys.clear();
+    this.expandedEmptyGroupKeys.clear();
+    this.resetPaginationPage();
+  }
+
+  private mergeSessionAppearance(local: DataViewState, saved: DataViewState): void {
+    const incoming = this.currentAppearance();
+    const kept: DataViewState = {};
+    const nextSaved: DataViewState = {};
+    for (const key of APPEARANCE_KEYS) {
+      const session = !sameAppearanceValue(key, local, saved);
+      Object.assign(kept, session ? { [key]: local[key] } : {});
+      Object.assign(nextSaved, { [key]: session ? saved[key] : incoming[key] });
+    }
+    const groupingResult = this.groupingResult;
+    this.applyAppearance(kept);
+    this.groupingResult = groupingResult;
+    this.savedAppearance = nextSaved;
+  }
+
+  canMoveItemBetweenGroups(item: Entity): boolean {
+    return Boolean(item.id);
+  }
+
+  canCreateInGroup(_groupKey: string): boolean {
+    return false;
+  }
+
+  createInGroup(_groupKey: string, _returnFocusTo?: HTMLElement | null): void {}
+
+  groupEditHref(_groupKey: string): string | undefined {
+    return undefined;
+  }
+
+  get filterColumns(): ColumnPresentation[] {
+    return [];
+  }
+
+  get canBoard(): boolean {
+    return this.supportsBoard && this.groupableFields.length > 0;
+  }
+
+  get isGrouped(): boolean {
+    return Boolean(this.grouping && this.groupingResult);
+  }
+
+  get groupingKey(): string {
+    return this.grouping ? encodeGroupingToken(this.grouping) : "";
+  }
+
+  get currentGroupableFieldId(): string {
+    const grouping = this.grouping;
+    if (!grouping) return "";
+
+    return this.groupableFields.find((field) => sameGrouping(field.grouping, grouping))?.id ?? "";
+  }
+
+  get sortableColumnIds(): Set<string> {
+    return new Set(this.columnsDefinition.filter((col) => col.sortable).map((col) => col.uid));
+  }
+
+  get canManage(): boolean {
+    if (!this.resource) return true;
+
+    return this.rootStore.userStore.can(this.resource, Action.create);
+  }
+
+  get canExport(): boolean {
+    if (!this.resource) return false;
+
+    return this.rootStore.userStore.canAccess(this.resource);
+  }
+
+  get isDisabled(): boolean {
+    if (!this.resource) return false;
+
+    return !this.canManage;
+  }
+
+  get hasSelection(): boolean {
+    return this.selectedIds.size > 0;
+  }
+
+  get selectedCount(): number {
+    return this.selectedIds.size;
+  }
+
+  get selectedVisibleCount(): number {
+    return this.items.reduce((count, item) => (this.selectedIds.has(item.id) ? count + 1 : count), 0);
+  }
+
+  get selectedOffViewCount(): number {
+    return this.selectedCount - this.selectedVisibleCount;
+  }
+
+  get isSelectionAtLimit(): boolean {
+    return this.selectedIds.size >= MAX_SELECTION_SIZE;
+  }
+
+  get currentSelectionScope(): SelectionScope {
+    return {
+      filters: toJS(this.filters) ?? [],
+      searchTerm: this.searchTerm || null,
+    };
+  }
+
+  get isSelectionScopeStale(): boolean {
+    if (!this.hasSelection || this.selectedScope === undefined) return false;
+
+    return !deepEqual(this.selectedScope, this.currentSelectionScope);
+  }
+
+  isItemSelectable(_item: Entity): boolean {
+    return true;
+  }
+
+  setSelectedIds = (keys: Set<string>) => {
+    this.selectedIds.clear();
+    this.onSelectionChanged();
+    this.selectedScope = undefined;
+    [...keys].slice(0, MAX_SELECTION_SIZE).forEach((id) => this.selectedIds.add(id));
+    this.rememberSelectionScope();
+  };
+
+  toggleItemSelection = (id: string): void => {
+    if (this.selectedIds.has(id)) {
+      this.selectedIds.delete(id);
+      this.rememberSelectionScope();
+      return;
+    }
+
+    if (this.isSelectionAtLimit) {
+      this.toastError("MassActions.limitReached", {
+        values: { limit: MAX_SELECTION_SIZE },
+      });
+      return;
+    }
+
+    this.selectedIds.add(id);
+    this.rememberSelectionScope();
+  };
+
+  setPageSelection = (selected: boolean): void => {
+    const pageIds = this.items.filter((item) => this.isItemSelectable(item)).map((item) => item.id);
+
+    if (!selected) {
+      pageIds.forEach((id) => this.selectedIds.delete(id));
+      this.rememberSelectionScope();
+      return;
+    }
+
+    const missing = pageIds.filter((id) => !this.selectedIds.has(id));
+    const room = Math.max(0, MAX_SELECTION_SIZE - this.selectedIds.size);
+    missing.slice(0, room).forEach((id) => this.selectedIds.add(id));
+    this.rememberSelectionScope();
+
+    if (missing.length > room) {
+      this.toastError("MassActions.limitReached", {
+        values: { limit: MAX_SELECTION_SIZE },
+      });
+    }
+  };
+
+  keepSelectionInView = (): void => {
+    const visible = new Set(this.items.map((item) => item.id));
+    for (const id of [...this.selectedIds]) if (!visible.has(id)) this.selectedIds.delete(id);
+    this.selectedScope = this.selectedIds.size > 0 ? this.currentSelectionScope : undefined;
+    this.onSelectionChanged();
+  };
+
+  clearSelection = () => {
+    this.selectedIds.clear();
+    this.selectedScope = undefined;
+    this.onSelectionChanged();
+  };
+
+  protected onSelectionChanged(): void {}
+
+  private rememberSelectionScope(): void {
+    this.onSelectionChanged();
+    if (this.selectedIds.size === 0) {
+      this.selectedScope = undefined;
+      return;
+    }
+
+    if (this.selectedScope === undefined) this.selectedScope = this.currentSelectionScope;
+  }
+
+  get orderedColumns() {
+    const columnMap = new Map(this.columnsDefinition.map((col) => [col.uid, col]));
+    const orderedUids = new Set(this.columnOrder);
+    const nameColumn = this.columnsDefinition.find((col) => col.uid === this.primaryColumnId);
+
+    if (this.columnOrder.length > 0) {
+      const columnsFromOrder = this.columnOrder
+        .map((uid) => columnMap.get(uid))
+        .filter((column): column is TableColumn => column !== undefined && column.uid !== this.primaryColumnId);
+
+      const columnsNotInOrder = this.columnsDefinition.filter(
+        (col) => !orderedUids.has(col.uid) && col.uid !== this.primaryColumnId,
+      );
+
+      const res: TableColumn[] = [];
+      if (nameColumn) res.push(nameColumn);
+      res.push(...columnsFromOrder, ...columnsNotInOrder);
+
+      return res;
+    }
+
+    const remainingColumns = this.columnsDefinition.filter((col) => col.uid !== this.primaryColumnId);
+
+    const res: TableColumn[] = [];
+    if (nameColumn) res.push(nameColumn);
+    res.push(...remainingColumns);
+
+    return res;
+  }
+
+  get visibleColumns(): TableColumn[] {
+    const hidden = new Set(this.hiddenColumns);
+    return this.orderedColumns.filter((column) => !hidden.has(column.uid));
+  }
+
+  setItems(args: GetResult<Entity>): void {
+    if (args.grouping?.partial) {
+      this.mergeGroupPage(args);
+      return;
+    }
+
+    const sessionScope =
+      this.isReady &&
+      !this.resolvingSavedView &&
+      args.p13nId === this.p13nId &&
+      (args.activeViewKey ?? ALL_VIEW_KEY) === this.activeViewKey;
+    const localAppearance = sessionScope ? this.currentAppearance() : undefined;
+    const savedAppearance = sessionScope ? this.savedAppearance : undefined;
+
+    this.requestGeneration += 1;
+    this.items = args.items;
+    this.p13nId = args.p13nId;
+    this.filterableFields = args.filterableFields || [];
+    this.searchTerm = args.searchTerm;
+    this.sortDescriptor = args.sortDescriptor;
+    this.pagination = args.pagination;
+    this.filters = this.withKnownFields(args.filters);
+    this.columnWidths = args.columnWidths || {};
+    this.hiddenColumns = (args.hiddenColumns ?? []).filter((uid) => uid !== this.primaryColumnId);
+    this.columnOrder = (args.columnOrder ?? []).filter((uid) => uid !== this.primaryColumnId);
+    this.viewMode = args.viewMode ?? ViewMode.table;
+    this.calendar = args.calendar ?? null;
+    this.grouping = args.grouping?.grouping ?? null;
+    this.groupingResult = args.grouping;
+    this.groupableFields = args.groupableFields ?? [];
+    this.views = args.views ?? [];
+    this.allViewState = args.allState ?? this.allViewState;
+    this.activeViewKey = args.activeViewKey ?? ALL_VIEW_KEY;
+    this.viewPersistable = args.viewPersistable ?? true;
+    this.groupCounts = args.groupCounts ?? {};
+    if (localAppearance && savedAppearance) this.mergeSessionAppearance(localAppearance, savedAppearance);
+    else this.savedAppearance = this.currentAppearance();
+    this.requestState = { status: "ready" };
+  }
+
+  private mergeGroupPage(args: GetResult<Entity>): void {
+    const page = args.grouping?.groups[0];
+    const current = this.groupingResult;
+    if (!page || !current) return;
+
+    this.requestGeneration += 1;
+
+    const merged = new Map(this.items.map((item) => [item.id, item]));
+    for (const item of args.items) merged.set(item.id, item);
+
+    this.items = [...merged.values()];
+    this.groupingResult = {
+      ...current,
+      groups: current.groups.map((group) =>
+        group.key === page.key
+          ? {
+              ...group,
+              itemIds: page.itemIds,
+              hasMore: page.hasMore,
+              materialised: true,
+            }
+          : group,
+      ),
+    };
+    this.requestState = { status: "ready" };
+  }
+
+  loadMoreInGroup = (groupKey: string): void => {
+    const current = this.groupedTakeOverrides[groupKey] ?? GROUP_PAGE_SIZE_DEFAULT;
+    this.groupedTakeOverrides = {
+      ...this.groupedTakeOverrides,
+      [groupKey]: current + GROUP_PAGE_SIZE_DEFAULT,
+    };
+    this.pendingGroupOnly = groupKey;
+    this.refreshQueryInBackground();
+  };
+
+  isGroupCollapsed = (groupKey: string): boolean => this.collapsedGroupKeys.has(groupKey);
+
+  isBoardStrip = (groupKey: string, count: number): boolean =>
+    count === 0 ? !this.expandedEmptyGroupKeys.has(groupKey) : this.collapsedGroupKeys.has(groupKey);
+
+  isGroupHidden = (groupKey: string): boolean => this.grouping?.hidden?.includes(groupKey) ?? false;
+
+  hideGroup = (groupKey: string): void => {
+    if (this.isGroupHidden(groupKey)) return;
+    this.setGroupPresentation({
+      hidden: [...(this.grouping?.hidden ?? []), groupKey],
+    });
+  };
+
+  showGroup = (groupKey: string): void => {
+    if (!this.isGroupHidden(groupKey)) return;
+    this.setGroupPresentation({
+      hidden: this.grouping?.hidden?.filter((key) => key !== groupKey),
+    });
+    this.pendingGroupOnly = groupKey;
+    this.refreshInBackground();
+  };
+
+  setHideEmptyGroups = (hideEmpty: boolean): void => {
+    this.setGroupPresentation({ hideEmpty });
+  };
+
+  setGroupSummaries = (summaries: GroupSummaryDefinition[]): void => {
+    if (!this.grouping) return;
+    this.grouping = { ...this.grouping, summaries };
+    this.appearanceChanged();
+    this.refreshInBackground();
+  };
+
+  private setGroupPresentation(patch: Pick<Grouping, "hidden" | "hideEmpty">): void {
+    if (!this.grouping) return;
+    const { hidden, hideEmpty, ...grouping } = { ...this.grouping, ...patch };
+    this.grouping = {
+      ...grouping,
+      ...(hidden?.length ? { hidden } : {}),
+      ...(hideEmpty ? { hideEmpty: true } : {}),
+    };
+    this.appearanceChanged();
+  }
+
+  toggleBoardStrip = (groupKey: string, count: number): void => {
+    if (count > 0) {
+      this.toggleGroupCollapsed(groupKey);
+      return;
+    }
+    if (this.expandedEmptyGroupKeys.has(groupKey)) this.expandedEmptyGroupKeys.delete(groupKey);
+    else this.expandedEmptyGroupKeys.add(groupKey);
+  };
+
+  toggleGroupCollapsed = (groupKey: string): void => {
+    if (!this.collapsedGroupKeys.has(groupKey)) {
+      this.collapsedGroupKeys.add(groupKey);
+      return;
+    }
+
+    this.collapsedGroupKeys.delete(groupKey);
+
+    const group = this.groupingResult?.groups.find((candidate) => candidate.key === groupKey);
+    if (!group || group.materialised || group.count === 0) return;
+
+    this.pendingGroupOnly = groupKey;
+    this.refreshInBackground();
+  };
+
+  setGroupSelection = (groupKey: string, selected: boolean): void => {
+    const inGroup = new Set(this.groupingResult?.groups.find((group) => group.key === groupKey)?.itemIds ?? []);
+    const groupIds = this.items
+      .filter((item) => inGroup.has(item.id) && this.isItemSelectable(item))
+      .map((item) => item.id);
+
+    if (!selected) {
+      groupIds.forEach((id) => this.selectedIds.delete(id));
+      this.rememberSelectionScope();
+      return;
+    }
+
+    const missing = groupIds.filter((id) => !this.selectedIds.has(id));
+    const room = Math.max(0, MAX_SELECTION_SIZE - this.selectedIds.size);
+    missing.slice(0, room).forEach((id) => this.selectedIds.add(id));
+    this.rememberSelectionScope();
+
+    if (missing.length > room) {
+      this.toastError("MassActions.limitReached", {
+        values: { limit: MAX_SELECTION_SIZE },
+      });
+    }
+  };
+
+  resetGroupedTakeOverrides = (): void => {
+    if (Object.keys(this.groupedTakeOverrides).length === 0) return;
+    this.groupedTakeOverrides = {};
+  };
+
+  setViewOptions = (updates: {
+    columnOrder?: string[];
+    columnWidth?: { uid: string; width: number };
+    columnWidths?: Record<string, number>;
+    hiddenColumns?: string[];
+    viewMode?: ViewMode;
+    grouping?: Grouping | null;
+    calendar?: CalendarViewConfig | null;
+  }) => {
+    let hasChanges = false;
+    let widthsChanged = false;
+    const groupingBefore = this.groupingKey;
+    const calendarModeBefore = this.viewMode === ViewMode.calendar;
+
+    if (updates.columnOrder) {
+      const newColumnOrder = updates.columnOrder.filter((uid) => uid !== this.primaryColumnId);
+
+      const orderChanged =
+        this.columnOrder.length !== newColumnOrder.length ||
+        this.columnOrder.some((uid, index) => uid !== newColumnOrder[index]);
+
+      if (orderChanged) {
+        this.columnOrder = newColumnOrder;
+        hasChanges = true;
+      }
+    }
+
+    if (updates.columnWidth) {
+      const newWidths = { ...this.columnWidths };
+      newWidths[updates.columnWidth.uid] = Math.max(80, updates.columnWidth.width);
+
+      if (!deepEqual(this.columnWidths, newWidths)) {
+        this.columnWidths = newWidths;
+        widthsChanged = true;
+      }
+    }
+
+    if (updates.columnWidths) {
+      if (!deepEqual(this.columnWidths, updates.columnWidths)) {
+        this.columnWidths = updates.columnWidths;
+        widthsChanged = true;
+      }
+    }
+
+    if (updates.hiddenColumns) {
+      const filteredHiddenColumns = updates.hiddenColumns.filter((uid) => uid !== this.primaryColumnId);
+      if (!deepEqual(this.hiddenColumns, filteredHiddenColumns)) {
+        this.hiddenColumns = filteredHiddenColumns;
+        hasChanges = true;
+      }
+    }
+
+    const viewModeChanged = "viewMode" in updates && this.viewMode !== updates.viewMode;
+    if (viewModeChanged) {
+      this.viewMode = updates.viewMode ?? ViewMode.table;
+      hasChanges = true;
+    }
+
+    const calendarChanged =
+      "calendar" in updates &&
+      !sameAppearanceValue("calendar", { calendar: this.calendar ?? null }, { calendar: updates.calendar ?? null });
+    if (calendarChanged) {
+      this.calendar = updates.calendar ?? null;
+      hasChanges = true;
+    }
+    const calendarQueryChanged =
+      (viewModeChanged && (calendarModeBefore || this.viewMode === ViewMode.calendar)) ||
+      (calendarChanged && this.viewMode === ViewMode.calendar);
+
+    if ("grouping" in updates && !sameGrouping(this.grouping, updates.grouping)) {
+      this.grouping = updates.grouping ?? null;
+      hasChanges = true;
+    }
+
+    const groupingChanged = groupingBefore !== this.groupingKey;
+    if (groupingChanged) {
+      this.resetGroupedTakeOverrides();
+      this.collapsedGroupKeys.clear();
+      this.expandedEmptyGroupKeys.clear();
+      this.resetPaginationPage();
+    }
+
+    if (hasChanges) this.appearanceChanged();
+    if (widthsChanged) {
+      this.persistViewState();
+      if (!hasChanges) this.onAppearanceChange();
+    }
+    if (groupingChanged || calendarQueryChanged) this.refreshQueryInBackground();
+    else if (viewModeChanged && this.viewMode === ViewMode.card && this.grouping) this.refreshInBackground();
+  };
+
+  setQueryOptions = (updates: {
+    filters?: Filter[];
+    pagination?: PaginationRequest;
+    sortDescriptor?: SortDescriptor | undefined;
+    searchTerm?: string;
+    forceRefresh?: boolean;
+    refreshMode?: DataViewRefreshMode;
+  }) => {
+    let hasChanges = false;
+    let queryShapeChanged = false;
+    let durableChanged = false;
+
+    if (updates.filters !== undefined && !deepEqual(this.filters, updates.filters)) {
+      this.filters = updates.filters;
+      hasChanges = true;
+      queryShapeChanged = true;
+    }
+
+    if (updates.pagination) {
+      const newPagination: PaginationRequest = this.pagination
+        ? { ...this.pagination, ...updates.pagination }
+        : {
+            page: updates.pagination.page,
+            pageSize: updates.pagination.pageSize,
+          };
+
+      if (!deepEqual(this.pagination, newPagination)) {
+        const pageSizeChanged = this.pagination?.pageSize !== newPagination.pageSize;
+        this.pagination = newPagination;
+        hasChanges = true;
+        if (pageSizeChanged) durableChanged = true;
+      }
+    }
+
+    if ("sortDescriptor" in updates && !deepEqual(this.sortDescriptor, updates.sortDescriptor)) {
+      this.sortDescriptor = updates.sortDescriptor;
+      hasChanges = true;
+      queryShapeChanged = true;
+      durableChanged = true;
+    }
+
+    if (updates.searchTerm !== undefined && (this.searchTerm || undefined) !== (updates.searchTerm || undefined)) {
+      this.searchTerm = updates.searchTerm;
+      hasChanges = true;
+      queryShapeChanged = true;
+    }
+
+    if (queryShapeChanged) {
+      this.resetPaginationPage();
+      this.resetGroupedTakeOverrides();
+      this.syncQueryDraft();
+    }
+
+    if (durableChanged) this.appearanceChanged();
+
+    if (!hasChanges && !updates.forceRefresh) return;
+
+    if (updates.refreshMode === "background") this.refreshInBackground();
+    else this.refreshQueryInBackground();
+  };
+
+  appendFilter = (filter: Filter) => {
+    this.setQueryOptions({ filters: [...(this.filters ?? []), filter] });
+  };
+
+  replaceFilterAt = (index: number, filter: Filter) => {
+    const current = this.filters ?? [];
+    if (index < 0 || index >= current.length) return;
+
+    this.setQueryOptions({
+      filters: current.map((entry, position) => (position === index ? filter : entry)),
+    });
+  };
+
+  removeFilterAt = (index: number) => {
+    const current = this.filters ?? [];
+    if (index < 0 || index >= current.length) return;
+
+    this.setQueryOptions({
+      filters: current.filter((_, position) => position !== index),
+    });
+  };
+
+  applyView = (viewKey: string): void => {
+    const previousKey = this.activeViewKey;
+    const flushed = this.flushPendingViewState();
+    const chip = this.views.find((view) => view.id === viewKey);
+    const key = chip ? chip.id : ALL_VIEW_KEY;
+    const saved: DataViewState = chip?.state ?? this.allViewState;
+    const draft = this.readQueryDraft(key);
+    const state: DataViewState = draft?.proposal ? { ...saved, ...draft.proposal.state } : saved;
+    const sessionAppearance = draft?.proposal ? undefined : draft?.appearance;
+
+    runInAction(() => {
+      this.requestGeneration += 1;
+      if (this.isReady) this.requestState = { status: "refreshing" };
+      this.activeViewKey = key;
+      this.proposal = draft?.proposal
+        ? {
+            ...(draft.proposal.name ? { name: draft.proposal.name } : {}),
+            isNew: draft.proposal.isNew,
+          }
+        : null;
+      this.filters = this.withKnownFields(draft?.filters ?? state.filters);
+      this.searchTerm = draft ? draft.searchTerm : state.searchTerm;
+      this.sortDescriptor = state.sortDescriptor ?? undefined;
+      this.viewMode = state.viewMode ?? ViewMode.table;
+      this.calendar = state.calendar ?? null;
+      this.grouping = state.grouping ?? null;
+      this.columnOrder = (state.columnOrder ?? []).filter((uid) => uid !== this.primaryColumnId);
+      this.columnWidths = state.columnWidths ?? {};
+      this.hiddenColumns = (state.hiddenColumns ?? []).filter((uid) => uid !== this.primaryColumnId);
+      this.pagination = this.pagination
+        ? {
+            ...this.pagination,
+            page: 1,
+            pageSize: state.pageSize ?? this.pagination.pageSize,
+          }
+        : this.pagination;
+      this.groupedTakeOverrides = {};
+      this.collapsedGroupKeys.clear();
+      this.expandedEmptyGroupKeys.clear();
+      this.savedAppearance = sessionAppearance ? draft?.savedAppearance : this.currentAppearance();
+      if (sessionAppearance) this.applyAppearance(sessionAppearance);
+    });
+
+    if (this.p13nId && this.viewPersistable) {
+      void selectDataViewAction({
+        surfaceKey: this.p13nId as DataViewSurfaceKey,
+        viewKey: key,
+      }).catch(reportApplicationError);
+    }
+
+    const reload = draft ? this.refreshQueryInBackground : this.refreshResolvedInBackground;
+    if (flushed && key === previousKey) void flushed.then(reload);
+    else reload();
+  };
+
+  saveViewChanges = async (): Promise<void> => {
+    if (!this.canSaveViewChanges) return;
+
+    this.cancelPendingPersist();
+    if (this.proposal?.isNew) {
+      await this.saveProposedView(this.proposal.name);
+      return;
+    }
+    const viewKey = this.activeViewKey;
+    if (this.proposal?.name && viewKey !== ALL_VIEW_KEY) {
+      await this.saveProposedRename(viewKey, this.proposal.name);
+      return;
+    }
+    await this.writeViewState({ includeQuery: true });
+    if (!this.failedViewStateWrites.has(viewKey)) runInAction(() => (this.proposal = null));
+    this.syncQueryDraft();
+  };
+
+  resetViewChanges = (): void => {
+    if (this.proposal) {
+      this.forgetQueryDraft(this.activeViewKey);
+      this.applyView(this.activeViewKey);
+      return;
+    }
+    if (this.savedAppearance) this.applyAppearance(this.savedAppearance);
+    this.setQueryOptions({
+      filters: this.savedQuery.filters,
+      forceRefresh: true,
+    });
+    this.syncQueryDraft();
+  };
+
+  applyViewProposal = (proposal: DataViewProposal): void => {
+    if (proposal.surfaceKey !== this.p13nId || !this.canSaveQuery) return;
+    const viewKey = proposalViewKey(proposal);
+    if (viewKey !== ALL_VIEW_KEY && !this.views.some((view) => view.id === viewKey)) return;
+
+    if (viewKey === this.activeViewKey) this.syncQueryDraft();
+    this.writeQueryDraft(viewKey, mergeProposalDraft(this.readQueryDraft(viewKey), proposal));
+    this.applyView(viewKey);
+  };
+
+  applySharedView = (shared: SharedView): boolean => {
+    if (!this.sharesViewState || shared.surfaceKey !== this.p13nId || !this.canSaveQuery) return false;
+    const columnIds = new Set(
+      this.columnsDefinition.map((column) => column.uid).filter((uid) => uid !== this.primaryColumnId),
+    );
+    const state = scopeSharedViewState(shared.state, {
+      columnIds,
+      filterFields: this.filterableFields.length
+        ? new Set(this.filterableFields.map((field) => field.field))
+        : undefined,
+      groupings: this.groupableFields.map((field) => field.grouping),
+      sortableColumnIds: this.sortableColumnIds,
+      supportsBoard: this.supportsBoard,
+      calendarFieldIds: this.calendarFieldIds,
+    });
+
+    this.writeQueryDraft(ALL_VIEW_KEY, {
+      filters: state.filters ?? [],
+      searchTerm: state.searchTerm || undefined,
+      proposal: { state, name: shared.name, isNew: true },
+    });
+    this.applyView(ALL_VIEW_KEY);
+    return true;
+  };
+
+  private saveProposedRename = async (viewKey: string, name: string): Promise<void> => {
+    if (!this.p13nId) return;
+    const renamed = await upsertDataViewAction({
+      id: viewKey,
+      name,
+      state: this.viewStateSnapshot({ includeQuery: true }),
+      surfaceKey: this.p13nId as DataViewSurfaceKey,
+    });
+    if (!renamed.ok) {
+      toastZodErrorTree(renamed.error);
+      return;
+    }
+    this.forgetQueryDraft(viewKey);
+    runInAction(() => {
+      this.proposal = null;
+      this.savedAppearance = this.currentAppearance();
+    });
+    await this.refresh();
+  };
+
+  private saveProposedView = async (name: string | undefined): Promise<void> => {
+    if (!name || !this.p13nId) return;
+    const proposedSearch = this.readQueryDraft(this.activeViewKey)?.proposal?.state.searchTerm !== undefined;
+    const created = await upsertDataViewAction({
+      name,
+      state: {
+        ...this.viewStateSnapshot({ includeQuery: true }),
+        ...(proposedSearch ? { searchTerm: this.searchTerm ?? "" } : {}),
+      },
+      surfaceKey: this.p13nId as DataViewSurfaceKey,
+    });
+    if (!created.ok) {
+      toastZodErrorTree(created.error);
+      return;
+    }
+    this.forgetQueryDraft(this.activeViewKey);
+    runInAction(() => (this.proposal = null));
+    await this.refresh();
+    this.applyView(created.data.id);
+  };
+
+  restoreQueryDraft = (): void => {
+    if (this.queryDraftRestored || !this.isReady) return;
+    this.queryDraftRestored = true;
+
+    const draft = this.readQueryDraft(this.activeViewKey);
+    if (draft?.proposal) {
+      this.applyView(this.activeViewKey);
+      return;
+    }
+    const appearanceRestored = draft ? this.restoreDraftAppearance(draft) : false;
+    if (!draft || this.isFilterModified || this.hasSessionSearch) {
+      this.syncQueryDraft();
+      if (appearanceRestored) this.refreshQueryInBackground();
+      return;
+    }
+
+    this.setQueryOptions({
+      filters: this.withKnownFields(draft.filters ?? this.savedQuery.filters),
+      searchTerm: draft.searchTerm ?? "",
+      forceRefresh: appearanceRestored,
+    });
+  };
+
+  private restoreDraftAppearance(draft: ViewDraft): boolean {
+    const session = draft.appearance;
+    const saved = draft.savedAppearance;
+    if (!session || !saved) return false;
+    const current = this.currentAppearance();
+    const restore: DataViewState = {};
+    const baseline: DataViewState = {};
+    for (const key of APPEARANCE_KEYS) {
+      const urlCarried = URL_CARRIED_APPEARANCE_KEYS.has(key);
+      Object.assign(baseline, {
+        [key]: urlCarried ? saved[key] : current[key],
+      });
+      if (!urlCarried || sameAppearanceValue(key, current, saved)) Object.assign(restore, { [key]: session[key] });
+    }
+    this.savedAppearance = baseline;
+    this.applyAppearance(restore);
+
+    return APPEARANCE_KEYS.some((key) => !sameAppearanceValue(key, current, this.currentAppearance()));
+  }
+
+  forgetQueryDraft = (viewKey: string): void => {
+    this.writeQueryDraft(viewKey, undefined);
+  };
+
+  private syncQueryDraft = (): void => {
+    const pending = this.proposal ? this.readQueryDraft(this.activeViewKey)?.proposal : undefined;
+    const display: DataViewState = this.viewStateSnapshot({
+      includeQuery: true,
+    });
+    delete display.filters;
+    delete display.searchTerm;
+    const proposal = pending
+      ? {
+          ...pending,
+          state: {
+            ...pending.state,
+            ...display,
+            filters: toJS(this.filters) ?? [],
+          },
+        }
+      : undefined;
+    this.writeQueryDraft(
+      this.activeViewKey,
+      proposal || this.hasSessionQuery
+        ? {
+            filters: toJS(this.filters) ?? [],
+            searchTerm: this.searchTerm || undefined,
+            ...(proposal ? { proposal } : {}),
+            ...(!proposal && this.isAppearanceModified && this.savedAppearance
+              ? {
+                  appearance: this.currentAppearance(),
+                  savedAppearance: toJS(this.savedAppearance),
+                }
+              : {}),
+          }
+        : undefined,
+    );
+  };
+
+  private queryDraftKey(viewKey: string): string | undefined {
+    const owner = viewQueryDraftOwner(this.rootStore.userStore?.user);
+    return this.p13nId && owner ? draftStorageKey(owner, this.p13nId, viewKey) : undefined;
+  }
+
+  private readQueryDraft(viewKey: string): ViewDraft | undefined {
+    const key = this.queryDraftKey(viewKey);
+    if (!key || !this.canSaveQuery || typeof window === "undefined") return undefined;
+
+    try {
+      return parseViewDraft(window.sessionStorage.getItem(key));
+    } catch {
+      return undefined;
+    }
+  }
+
+  private writeQueryDraft(viewKey: string, draft: ViewDraft | undefined): void {
+    const key = this.queryDraftKey(viewKey);
+    if (!key || typeof window === "undefined") return;
+
+    try {
+      if (draft) window.sessionStorage.setItem(key, JSON.stringify(draft));
+      else window.sessionStorage.removeItem(key);
+    } catch {
+      return;
+    }
+  }
+
+  private withKnownFields(filters: Filter[] | undefined): Filter[] {
+    const list = filters ?? [];
+    if (this.filterableFields.length === 0) return list;
+    const known = new Set(this.filterableFields.map((f) => f.field));
+    return list.filter((f) => known.has(f.field));
+  }
+
+  refresh = (): Promise<void> => this.executeRefresh("background");
+
+  protected refreshGuarded = (shouldCommit: () => boolean): Promise<void> =>
+    this.executeRefresh("background", shouldCommit);
+
+  private executeRefresh = async (
+    mode: DataViewRefreshMode,
+    shouldCommit?: () => boolean,
+    resolveFromServer = false,
+  ): Promise<void> => {
+    const generation = ++this.requestGeneration;
+    const wasInitialized = this.isReady;
+    const writeSeqBeforeRequest = this.viewStateWriteSeq;
+    const projectionBeforeRequest = {
+      surfaceKey: this.p13nId,
+      viewKey: this.activeViewKey,
+      columnOrder: toJS(this.columnOrder),
+      columnWidths: toJS(this.columnWidths),
+      hiddenColumns: toJS(this.hiddenColumns),
+    };
+    const pendingProjectionAtStart =
+      !resolveFromServer &&
+      (this.persistViewStateTimer !== undefined ||
+        this.proposal !== null ||
+        this.queuedViewStateWrites.has(JSON.stringify([this.p13nId, this.activeViewKey])) ||
+        this.failedViewStateWrites.has(this.activeViewKey));
+    const groupPage = this.buildGroupPageRequest();
+    const params: GetQueryParams = resolveFromServer
+      ? {
+          p13nId: this.p13nId,
+          viewId: this.activeViewKey,
+        }
+      : {
+          p13nId: this.p13nId,
+          viewId: wasInitialized ? this.activeViewKey : undefined,
+          filters: toJS(this.filters),
+          searchTerm: toJS(this.searchTerm),
+          sortDescriptor: toJS(this.sortDescriptor),
+          ...(groupPage
+            ? { groupPage, pageSize: this.pagination?.pageSize }
+            : {
+                pagination: this.pagination
+                  ? {
+                      page: this.pagination.page,
+                      pageSize: this.pagination.pageSize,
+                    }
+                  : undefined,
+              }),
+          viewMode: this.viewMode,
+          grouping: toJS(this.grouping),
+          calendar: this.calendar,
+          ...this.extraQueryParams(),
+        };
+
+    runInAction(() => {
+      if (mode === "visible") this.requestState = { status: "refreshing" };
+    });
+
+    const discardIfStale = (): boolean => {
+      const ownsRequest = generation === this.requestGeneration;
+      const ownsGuard = shouldCommit?.() ?? true;
+      if (ownsRequest && ownsGuard) return false;
+
+      if (ownsRequest && !ownsGuard && this.requestState.status === "refreshing") {
+        runInAction(() => {
+          this.requestState = wasInitialized ? { status: "ready" } : { status: "uninitialized" };
+        });
+      }
+
+      return true;
+    };
+
+    let result: GetResult<Entity>;
+    try {
+      result = await this.refreshAction(params);
+    } catch (error) {
+      if (discardIfStale()) return;
+
+      runInAction(() => {
+        this.requestState = wasInitialized ? { status: "refresh-error", error } : { status: "uninitialized" };
+      });
+      throw error;
+    }
+
+    if (discardIfStale()) return;
+
+    runInAction(() => {
+      const localAllState = this.allViewState;
+      const localViews = this.views;
+      const localProjection = {
+        columnOrder: toJS(this.columnOrder),
+        columnWidths: toJS(this.columnWidths),
+        hiddenColumns: toJS(this.hiddenColumns),
+      };
+      const sameProjectionScope =
+        wasInitialized &&
+        projectionBeforeRequest.surfaceKey !== undefined &&
+        projectionBeforeRequest.surfaceKey === this.p13nId &&
+        projectionBeforeRequest.viewKey === this.activeViewKey &&
+        projectionBeforeRequest.surfaceKey === result.p13nId &&
+        projectionBeforeRequest.viewKey === (result.activeViewKey ?? ALL_VIEW_KEY);
+      const keepOrder =
+        sameProjectionScope &&
+        (pendingProjectionAtStart || !deepEqual(localProjection.columnOrder, projectionBeforeRequest.columnOrder));
+      const keepWidths =
+        sameProjectionScope &&
+        (pendingProjectionAtStart || !deepEqual(localProjection.columnWidths, projectionBeforeRequest.columnWidths));
+      const keepHidden =
+        sameProjectionScope &&
+        (pendingProjectionAtStart || !deepEqual(localProjection.hiddenColumns, projectionBeforeRequest.hiddenColumns));
+
+      this.onRefreshAccepted(result);
+      this.resolvingSavedView = resolveFromServer;
+      try {
+        this.setItems(result);
+      } finally {
+        this.resolvingSavedView = false;
+      }
+      const available = new Set(this.columnsDefinition.map((column) => column.uid));
+      if (keepOrder)
+        this.columnOrder = localProjection.columnOrder.filter((id) => available.has(id) && id !== this.primaryColumnId);
+      if (keepWidths) {
+        this.columnWidths = Object.fromEntries(
+          Object.entries(localProjection.columnWidths).filter(([id]) => isPersistedColumnWidthKey(id, available)),
+        );
+      }
+      if (keepHidden) {
+        this.hiddenColumns = localProjection.hiddenColumns.filter(
+          (id) => available.has(id) && id !== this.primaryColumnId,
+        );
+      }
+      this.restoreViewStateWrittenDuringRequest(writeSeqBeforeRequest, localAllState, localViews);
+      if (resolveFromServer) this.syncQueryDraft();
+    });
+  };
+
+  private get requestCollapsedGroupKeys(): string[] {
+    return [...new Set([...this.collapsedGroupKeys, ...(this.grouping?.hidden ?? [])])].slice(0, MAX_AXIS_GROUPS);
+  }
+
+  private buildGroupPageRequest(): GroupPageRequest | undefined {
+    const only = this.pendingGroupOnly;
+    this.pendingGroupOnly = undefined;
+
+    if (!this.grouping) return undefined;
+
+    return {
+      perGroup: GROUP_PAGE_SIZE_DEFAULT,
+      ...(Object.keys(this.groupedTakeOverrides).length > 0 ? { overrides: toJS(this.groupedTakeOverrides) } : {}),
+      ...(this.requestCollapsedGroupKeys.length > 0 ? { collapsed: this.requestCollapsedGroupKeys } : {}),
+      ...(only === undefined ? {} : { only }),
+    };
+  }
+
+  upsertItem = async (target: Entity, options: { created?: boolean } = {}): Promise<void> => {
+    const isLoaded = this.items.some(({ id }) => id === target.id);
+    this.upsertItemLocal(target);
+    if (options.created && !isLoaded) this.adjustPaginationTotal(1);
+    this.requestGeneration += 1;
+    if (this.requestState.status !== "uninitialized") this.requestState = { status: "ready" };
+    await this.executeOnChanges();
+  };
+
+  upsertItemLocal = (target: Entity): void => {
+    const targetId = target.id;
+    const existingIndex = this.items.findIndex(({ id: sourceId }) => sourceId === targetId);
+
+    this.items =
+      existingIndex >= 0
+        ? this.items.map((source) => (source.id === targetId ? target : source))
+        : [...this.items, target];
+  };
+
+  removeItem = async (targetId: string): Promise<void> => {
+    const items = this.items.filter(({ id: sourceId }) => sourceId !== targetId);
+
+    if (items.length < this.items.length) this.adjustPaginationTotal(-1);
+    this.items = items;
+    this.requestGeneration += 1;
+    if (this.requestState.status !== "uninitialized") this.requestState = { status: "ready" };
+    await this.executeOnChanges();
+  };
+
+  private adjustPaginationTotal(delta: number): void {
+    if (this.pagination?.total === undefined) return;
+
+    const total = Math.max(0, this.pagination.total + delta);
+    this.pagination = {
+      ...this.pagination,
+      total,
+      totalPages: Math.max(1, Math.ceil(total / this.pagination.pageSize)),
+    };
+  }
+
+  registerOnChange = (callback: () => void | Promise<void>): (() => void) => {
+    this.onChangesCallbacks.push(callback);
+
+    return () => {
+      const index = this.onChangesCallbacks.indexOf(callback);
+      if (index > -1) this.onChangesCallbacks.splice(index, 1);
+    };
+  };
+
+  executeOnChanges = async () => {
+    const promises = this.onChangesCallbacks.map((callback) => callback());
+
+    await Promise.all(promises);
+  };
+
+  async refreshQuery(): Promise<void> {
+    if (!this.isReady) return;
+
+    try {
+      await this.executeRefresh("visible");
+    } catch (error) {
+      if (!notifyIfWorkspaceChanged(error)) this.toastError("Common.notifications.unexpectedError");
+      throw error;
+    }
+  }
+
+  private refreshQueryInBackground = (): void => {
+    void this.refreshQuery().catch(() => undefined);
+  };
+
+  reloadSavedView = (): Promise<void> => this.executeRefresh(this.isReady ? "visible" : "background", undefined, true);
+
+  private refreshResolvedInBackground = (): void => {
+    void this.executeRefresh(this.isReady ? "visible" : "background", undefined, true).catch(() => undefined);
+  };
+
+  refreshInBackground = (): void => {
+    if (!this.isReady) return;
+
+    if (this.backgroundRefreshRunning) {
+      this.backgroundRefreshQueued = true;
+      return;
+    }
+
+    void this.drainBackgroundRefreshes();
+  };
+
+  private drainBackgroundRefreshes = async (): Promise<void> => {
+    this.backgroundRefreshRunning = true;
+
+    try {
+      do {
+        this.backgroundRefreshQueued = false;
+        try {
+          await this.executeRefresh("background", () => !this.backgroundRefreshQueued);
+        } catch (error) {
+          if (!notifyIfWorkspaceChanged(error) && !(error instanceof ForbiddenError))
+            this.toastError("Common.notifications.unexpectedError");
+        }
+      } while (this.backgroundRefreshQueued);
+    } finally {
+      this.backgroundRefreshRunning = false;
+    }
+  };
+
+  protected onRefreshAccepted(_result: GetResult<Entity>): void {}
+
+  protected onAppearanceChange(): void {}
+
+  protected get viewStateWriteOwner(): string | undefined {
+    return undefined;
+  }
+
+  protected canPersistViewState(): boolean {
+    return true;
+  }
+
+  protected extraQueryParams(): Partial<GetQueryParams> {
+    return {};
+  }
+
+  protected refreshAction(_params?: GetQueryParams): Promise<GetResult<Entity>> {
+    return Promise.reject(new Error("refreshAction must be implemented by entity stores"));
+  }
+
+  discardPendingViewState = (): void => {
+    this.cancelPendingPersist();
+    this.pendingViewStateIntent?.discard();
+    this.pendingViewStateIntent = undefined;
+  };
+
+  private viewStateWrite: Promise<void> | undefined;
+  private queuedViewStateWrites = new Map<string, number>();
+  private failedViewStateWrites = new Set<string>();
+
+  settleViewState = async (): Promise<void> => {
+    const viewKey = this.activeViewKey;
+    const flushed = this.flushPendingViewState();
+    if (!flushed && this.failedViewStateWrites.has(viewKey)) void this.writeViewState();
+    await this.viewStateWrite;
+    if (this.failedViewStateWrites.has(viewKey)) throw new Error("The current view could not be saved.");
+  };
+
+  private cancelPendingPersist = (): boolean => {
+    if (this.persistViewStateTimer === undefined) return false;
+
+    clearTimeout(this.persistViewStateTimer);
+    this.persistViewStateTimer = undefined;
+    return true;
+  };
+
+  protected flushPendingViewState = (): Promise<void> | undefined => {
+    if (!this.cancelPendingPersist()) return undefined;
+
+    return this.writeViewState();
+  };
+
+  private appearanceChanged = () => {
+    if (this.canSaveQuery) this.syncQueryDraft();
+    else this.persistViewState();
+    this.onAppearanceChange();
+  };
+
+  private persistViewState = () => {
+    if (!this.p13nId || !this.viewPersistable || !this.canPersistViewState()) return;
+    if (this.proposal) {
+      this.syncQueryDraft();
+      return;
+    }
+
+    this.discardPendingViewState();
+    this.pendingViewStateIntent = this.reserveViewStateIntent();
+
+    this.persistViewStateTimer = window.setTimeout(() => {
+      this.persistViewStateTimer = undefined;
+      void this.writeViewState();
+    }, 1000);
+  };
+
+  private reserveViewStateIntent = (): ViewStateWriteIntent | undefined => {
+    const owner = this.viewStateWriteOwner;
+    return owner === undefined
+      ? undefined
+      : reserveViewStateWrite(this.rootStore, JSON.stringify([owner, this.p13nId, this.activeViewKey]));
+  };
+
+  private writeViewState = ({ includeQuery = false }: { includeQuery?: boolean } = {}): Promise<void> => {
+    if (!this.canPersistViewState()) {
+      this.discardPendingViewState();
+      return Promise.resolve();
+    }
+    const intent = this.pendingViewStateIntent ?? this.reserveViewStateIntent();
+    this.pendingViewStateIntent = undefined;
+    const viewKey = this.activeViewKey;
+    const state = this.viewStateSnapshot({ includeQuery });
+    const appearance = includeQuery ? this.currentAppearance() : undefined;
+
+    const surfaceKey = this.p13nId as DataViewSurfaceKey;
+    const ownsWrite = () => this.canPersistViewState() && (!intent || intent.isCurrent());
+    const persist = () => {
+      if (!ownsWrite()) return Promise.resolve();
+      return saveDataViewStateAction({ surfaceKey, viewKey, state })
+        .then((res) => {
+          if (!ownsWrite()) return;
+          if (!res.ok) {
+            this.failedViewStateWrites.add(viewKey);
+            toastZodErrorTree(res.error);
+            return;
+          }
+
+          this.failedViewStateWrites.delete(viewKey);
+          this.rememberViewState(viewKey, state);
+          if (appearance && viewKey === this.activeViewKey) runInAction(() => (this.savedAppearance = appearance));
+        })
+        .catch((error) => {
+          if (!ownsWrite()) return;
+          this.failedViewStateWrites.add(viewKey);
+          reportApplicationError(error);
+        });
+    };
+    const pendingKey = JSON.stringify([surfaceKey, viewKey]);
+    this.queuedViewStateWrites.set(pendingKey, (this.queuedViewStateWrites.get(pendingKey) ?? 0) + 1);
+    const enqueue = () => (intent ? intent.enqueue(persist) : persist());
+    const write = this.viewStateWrite ? this.viewStateWrite.then(enqueue) : enqueue();
+    this.viewStateWrite = write;
+    void write.then(() => {
+      if (this.viewStateWrite === write) this.viewStateWrite = undefined;
+      const remaining = (this.queuedViewStateWrites.get(pendingKey) ?? 1) - 1;
+      if (remaining > 0) this.queuedViewStateWrites.set(pendingKey, remaining);
+      else this.queuedViewStateWrites.delete(pendingKey);
+    });
+    return write;
+  };
+
+  private rememberViewState = (viewKey: string, state: DataViewState): void => {
+    runInAction(() => {
+      this.viewStateWriteSeq += 1;
+      this.viewStateWrites.set(viewKey, this.viewStateWriteSeq);
+
+      if (viewKey === ALL_VIEW_KEY) {
+        this.allViewState = state;
+        return;
+      }
+
+      this.views = this.views.map((view) => (view.id === viewKey ? { ...view, state } : view));
+    });
+  };
+
+  private restoreViewStateWrittenDuringRequest = (
+    writeSeq: number,
+    localAllState: DataViewState,
+    localViews: DataViewChipDto[],
+  ): void => {
+    for (const [viewKey, seq] of this.viewStateWrites) {
+      if (seq <= writeSeq) continue;
+
+      if (viewKey === ALL_VIEW_KEY) {
+        this.allViewState = localAllState;
+        continue;
+      }
+
+      const local = localViews.find((view) => view.id === viewKey);
+      if (local) this.views = this.views.map((view) => (view.id === viewKey ? { ...view, state: local.state } : view));
+    }
+  };
+
+  private resetPaginationPage = () => {
+    if (!this.pagination) return;
+    if (this.pagination.page === 1) return;
+    this.pagination = { ...this.pagination, page: 1 };
+  };
+}
