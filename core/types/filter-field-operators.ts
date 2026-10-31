@@ -1,0 +1,57 @@
+import { FilterOperatorKey } from "@/core/base/base-query-builder";
+
+import { FilterFieldKey } from "./filter-field-key";
+
+const dateOperators = [
+  FilterOperatorKey.gt,
+  FilterOperatorKey.gte,
+  FilterOperatorKey.lt,
+  FilterOperatorKey.lte,
+  FilterOperatorKey.between,
+  FilterOperatorKey.inLastDays,
+  FilterOperatorKey.notInLastDays,
+];
+
+const scalarSelectOperators = [FilterOperatorKey.in, FilterOperatorKey.notIn];
+
+const stringOperators = [FilterOperatorKey.equals, FilterOperatorKey.contains];
+const textFieldOperators = [FilterOperatorKey.equals, FilterOperatorKey.startsWith, FilterOperatorKey.contains];
+
+const draftOperators = [FilterOperatorKey.hasSome, FilterOperatorKey.hasNone];
+
+export const FILTER_FIELD_DEFAULT_OPERATORS: Record<FilterFieldKey, FilterOperatorKey[]> = {
+  [FilterFieldKey.participantContactId]: scalarSelectOperators,
+  [FilterFieldKey.ownerUserId]: scalarSelectOperators,
+  [FilterFieldKey.participants]: [FilterOperatorKey.hasUnset, FilterOperatorKey.allSet],
+  [FilterFieldKey.timelineKind]: scalarSelectOperators,
+  [FilterFieldKey.timelineThreadId]: scalarSelectOperators,
+  [FilterFieldKey.updatedAt]: dateOperators,
+  [FilterFieldKey.createdAt]: dateOperators,
+  [FilterFieldKey.event]: scalarSelectOperators,
+  [FilterFieldKey.url]: stringOperators,
+  [FilterFieldKey.status]: scalarSelectOperators,
+  [FilterFieldKey.provider]: scalarSelectOperators,
+  [FilterFieldKey.state]: scalarSelectOperators,
+  [FilterFieldKey.draft]: draftOperators,
+  [FilterFieldKey.connectedAccountId]: scalarSelectOperators,
+  [FilterFieldKey.webhookId]: scalarSelectOperators,
+  [FilterFieldKey.emailFolder]: scalarSelectOperators,
+  [FilterFieldKey.lastMessageDirection]: scalarSelectOperators,
+  [FilterFieldKey.lastMessageSentAt]: dateOperators,
+  [FilterFieldKey.lastMessageAt]: dateOperators,
+  [FilterFieldKey.calendarId]: scalarSelectOperators,
+  [FilterFieldKey.startsAt]: dateOperators,
+  [FilterFieldKey.plan]: scalarSelectOperators,
+  [FilterFieldKey.subscriptionStatus]: scalarSelectOperators,
+  [FilterFieldKey.isPlatformOperator]: scalarSelectOperators,
+  [FilterFieldKey.lastActiveAt]: dateOperators,
+  [FilterFieldKey.workspaceId]: scalarSelectOperators,
+  [FilterFieldKey.adProvider]: scalarSelectOperators,
+  [FilterFieldKey.auditSource]: scalarSelectOperators,
+  [FilterFieldKey.workspaceTags]: scalarSelectOperators,
+  [FilterFieldKey.name]: textFieldOperators,
+  [FilterFieldKey.firstName]: textFieldOperators,
+  [FilterFieldKey.lastName]: textFieldOperators,
+  [FilterFieldKey.trashKind]: [FilterOperatorKey.in],
+  [FilterFieldKey.trashList]: [FilterOperatorKey.in],
+};
