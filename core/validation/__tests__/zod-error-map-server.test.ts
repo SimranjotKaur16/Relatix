@@ -1,0 +1,136 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+
+import type * as LocaleRegistry from "@/i18n/locale-registry";
+import { CustomErrorCode } from "../validation.types";
+
+const registry = vi.hoisted(() => ({
+  locale: "en",
+  validationTagFor: vi.fn((locale: string) => locale),
+}));
+
+vi.mock("next-intl/server", () => ({
+  getLocale: vi.fn(() => Promise.resolve(registry.locale)),
+  getTranslations: vi.fn(() => {
+    const locale = registry.locale;
+    return Promise.resolve({ raw: (key: string) => `${locale}:${key}` });
+  }),
+}));
+
+vi.mock("@/i18n/locale-registry", async (importOriginal) => {
+  const actual = await importOriginal<typeof LocaleRegistry>();
+  return { ...actual, validationTagFor: registry.validationTagFor };
+});
+
+import { ConnectedAccountEmailSchema, defaultEmailSettings } from "@/ee/messaging/email-settings";
+import { APP_LOCALES } from "@/i18n/locale-registry";
+import { getZodParseContext } from "../zod-error-map-server";
+
+afterEach(() => {
+  registry.locale = "en";
+  z.config(z.locales.en());
+  vi.clearAllMocks();
+});
+
+describe("getZodParseContext", () => {
+  it.each(APP_LOCALES)("localizes email colour validation for %s fields and toasts", async (locale) => {
+    registry.locale = locale;
+    const settings = defaultEmailSettings();
+    settings.appearance.linkHex = "#zzzzzz";
+    const result = ConnectedAccountEmailSchema.safeParse({ signature: "", settings }, await getZodParseContext());
+
+    expect(result.success).toBe(false);
+    if (result.success) return;
+    expect(result.error.issues).toEqual([
+      expect.objectContaining({
+        path: ["settings", "appearance", "linkHex"],
+        message: `${locale}:Common.errors.emailLinkColourInvalid`,
+      }),
+    ]);
+  });
+
+  it.each(APP_LOCALES)("uses application copy for common %s format errors", async (locale) => {
+    registry.locale = locale;
+    const context = await getZodParseContext();
+
+    const email = z.email().safeParse("not-an-email", context);
+    const url = z.url().safeParse("://", context);
+
+    expect(email.success).toBe(false);
+    expect(url.success).toBe(false);
+    if (!email.success) expect(email.error.issues[0].message).toBe(`${locale}:Common.errors.invalidEmail`);
+    if (!url.success) expect(url.error.issues[0].message).toBe(`${locale}:Common.errors.invalidUrl`);
+  });
+
+  it.each(APP_LOCALES)("reports an empty %s id as blank instead of an invalid UUID", async (locale) => {
+    registry.locale = locale;
+    const context = await getZodParseContext();
+
+    const blank = z
+      .object({ name: z.string(), services: z.array(z.object({ serviceId: z.uuid(), quantity: z.number() })) })
+      .safeParse({ name: "Deal", services: [{ serviceId: "", quantity: 1 }] }, context);
+    const malformed = z.uuid().safeParse("not-a-uuid", context);
+
+    expect(blank.success).toBe(false);
+    if (!blank.success) {
+      expect(blank.error.issues).toEqual([
+        expect.objectContaining({
+          path: ["services", 0, "serviceId"],
+          message: `${locale}:Common.errors.mustNotBeBlank`,
+        }),
+      ]);
+    }
+    expect(malformed.success).toBe(false);
+    if (!malformed.success) expect(malformed.error.issues[0].message).not.toContain("Common.errors");
+  });
+
+  it("loads the registry-selected Zod locale without mutating global configuration", async () => {
+    registry.locale = "de";
+    const context = await getZodParseContext();
+
+    expect(registry.validationTagFor).toHaveBeenCalledWith("de");
+
+    const localized = z.string().min(5).safeParse("a", context);
+    expect(localized.success).toBe(false);
+    if (!localized.success) expect(localized.error.issues[0].message).toContain("Zu klein");
+
+    const global = z.string().min(5).safeParse("a");
+    expect(global.success).toBe(false);
+    if (!global.success) expect(global.error.issues[0].message).toContain("Too small");
+  });
+
+  it("keeps concurrent custom-error translations isolated per request", async () => {
+    registry.locale = "en";
+    const englishContext = await getZodParseContext();
+    registry.locale = "de";
+    const germanContext = await getZodParseContext();
+    const schema = z.string().superRefine(async (_value, ctx) => {
+      await Promise.resolve();
+      ctx.addIssue({ code: "custom", params: { error: CustomErrorCode.generic } });
+    });
+
+    const [english, german] = await Promise.all([
+      schema.safeParseAsync("value", englishContext),
+      schema.safeParseAsync("value", germanContext),
+    ]);
+
+    expect(english.success).toBe(false);
+    expect(german.success).toBe(false);
+    if (!english.success) expect(english.error.issues[0].message).toBe("en:Common.errors.generic");
+    if (!german.success) expect(german.error.issues[0].message).toBe("de:Common.errors.generic");
+  });
+});
+
+describe("outside a request scope", () => {
+  it("falls back to the default locale instead of throwing", async () => {
+    const { getLocale, getTranslations } = await import("next-intl/server");
+    vi.mocked(getLocale).mockRejectedValueOnce(new Error("`getLocale` is not supported in Client Components"));
+    vi.mocked(getTranslations).mockRejectedValueOnce(new Error("no request scope"));
+
+    const context = await getZodParseContext();
+    const result = z.string().email().safeParse("not-an-email", context);
+
+    expect(result.success).toBe(false);
+    expect(result.error?.issues[0]?.message).toBeTruthy();
+  });
+});
