@@ -1,0 +1,107 @@
+import { describe, expect, it } from "vitest";
+
+import type { RootStore } from "../root.store";
+
+import { Locale } from "@/generated/prisma";
+
+import { IntlStore } from "../intl.store";
+
+describe("IntlStore locale resolution", () => {
+  it("uses the routed display locale before a user is hydrated", () => {
+    const store = new IntlStore({
+      localeStore: { locale: "de" },
+      userStore: { user: null },
+    } as unknown as RootStore);
+
+    expect(store.formattingLocale).toBe("de-DE");
+  });
+
+  it("uses an explicit formatting preference through the registry", () => {
+    const store = new IntlStore({
+      localeStore: { locale: "fr" },
+      userStore: { user: { formattingLocale: Locale.fr } },
+    } as unknown as RootStore);
+
+    expect(store.formattingLocale).toBe("fr-FR");
+    expect(store.parseNumber("1\u202f234,5")).toBe(1234.5);
+  });
+
+  it("resolves System from the routed display locale", () => {
+    const store = new IntlStore({
+      localeStore: { locale: "de" },
+      userStore: { user: { formattingLocale: Locale.system } },
+    } as unknown as RootStore);
+
+    expect(store.formattingLocale).toBe("de-DE");
+    expect(store.resolvedFormattingLanguageTag).toBe("de-DE");
+  });
+});
+
+describe("IntlStore zoned-value hydration gate", () => {
+  function createStore() {
+    return new IntlStore({
+      localeStore: { locale: "en" },
+      userStore: { user: { formattingLocale: Locale.en } },
+    } as unknown as RootStore);
+  }
+
+  const date = new Date("2025-09-09T15:00:00.000Z");
+
+  it("renders no zoned value before the client has mounted, so server output cannot depend on the server's timezone", () => {
+    const store = createStore();
+
+    expect(store.rendersZonedValues).toBe(false);
+    expect(store.formatNumericalShortDateTime(date)).toBe("");
+    expect(store.formatNumericalShortDate(date)).toBe("");
+    expect(store.formatDescriptiveLongDateTime(date)).toBe("");
+    expect(store.formatTime(date)).toBe("");
+    expect(store.formatRelativeTime(date)).toBe("");
+  });
+
+  it("renders zoned values once the client has mounted", () => {
+    const store = createStore();
+    store.markClientHydrated();
+
+    expect(store.rendersZonedValues).toBe(true);
+    expect(store.formatNumericalShortDateTime(date)).not.toBe("");
+    expect(store.formatTime(date)).not.toBe("");
+  });
+
+  it("keeps timezone-independent formatting available before mount", () => {
+    const store = createStore();
+
+    expect(store.formatNumber(1234.5)).not.toBe("");
+  });
+});
+
+describe("IntlStore credit display", () => {
+  it("writes an amount below a tenth of a credit with the locale's below-minimum copy", async () => {
+    const { createTranslator } = await import("next-intl");
+    const messages = (await import("@/i18n/locales/fr.json")).default;
+    const t = createTranslator({ locale: "fr", messages });
+    const localeStore = {
+      locale: "fr",
+      translation: (key: string, values?: Record<string, string>) => t(key as never, values as never),
+      getTranslation(key: string, values?: Record<string, string>) {
+        return this.translation(key, values);
+      },
+    };
+    const store = new IntlStore({
+      localeStore,
+      userStore: { user: { formattingLocale: Locale.fr } },
+    } as unknown as RootStore);
+
+    expect(store.formatAgentCredits(0.00001)).toEqual({ credits: 0.1, amount: "< 0,1" });
+    expect(store.formatAgentCredits(-0.00001).amount).toBe("-< 0,1");
+    expect(store.formatAgentCredits(1.25).amount).toBe("1,3");
+  });
+
+  it("falls back to a bare less-than sign before translations load", () => {
+    const store = new IntlStore({
+      localeStore: { locale: "en", translation: null, getTranslation: (key: string) => key },
+      userStore: { user: { formattingLocale: Locale.en } },
+    } as unknown as RootStore);
+
+    expect(store.formatAgentCredits(0.00001).amount).toBe("<0.1");
+  });
+});
