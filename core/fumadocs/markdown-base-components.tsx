@@ -1,0 +1,128 @@
+import type { MDXComponents } from "mdx/types";
+import type { ComponentProps } from "react";
+
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { AppLink } from "@/components/shared/app-link";
+import { MarketingTableFrame } from "@/components/marketing/marketing-table-frame";
+import { DocsCodeBlock } from "./docs-code-block";
+import { cn } from "@/core/utils/cn";
+
+export const markdownBaseComponents: Pick<
+  MDXComponents,
+  | "h1"
+  | "h2"
+  | "h3"
+  | "h4"
+  | "h5"
+  | "h6"
+  | "p"
+  | "li"
+  | "a"
+  | "blockquote"
+  | "code"
+  | "pre"
+  | "table"
+  | "thead"
+  | "tbody"
+  | "tr"
+  | "th"
+  | "td"
+> = {
+  h1: ({ className, children, ...props }) => (
+    <h1 className={cn("text-x-3xl text-display-gradient", className)} {...props}>
+      {children}
+    </h1>
+  ),
+  h2: ({ className, children, ...props }) => (
+    <h2 className={cn("text-x-2xl", className)} {...props}>
+      {children}
+    </h2>
+  ),
+  h3: ({ className, children, ...props }) => (
+    <h3 className={cn("text-x-xl", className)} {...props}>
+      {children}
+    </h3>
+  ),
+  h4: ({ className, children, ...props }) => (
+    <h4 className={cn("text-x-lg", className)} {...props}>
+      {children}
+    </h4>
+  ),
+  h5: ({ className, children, ...props }) => (
+    <h5 className={cn("text-x-md", className)} {...props}>
+      {children}
+    </h5>
+  ),
+  h6: ({ className, children, ...props }) => (
+    <h6 className={cn("text-x-sm", className)} {...props}>
+      {children}
+    </h6>
+  ),
+  p: ({ className, children, ...props }) => (
+    <p className={cn("text-x-md", className)} {...props}>
+      {children}
+    </p>
+  ),
+  li: ({ className, children, ...props }) => (
+    <li className={cn("text-x-md", className)} {...props}>
+      {children}
+    </li>
+  ),
+  a: ({ className, children, ...props }) => (
+    <AppLink inheritSize appearance="inline" className={className} {...(props as ComponentProps<typeof AppLink>)}>
+      {children}
+    </AppLink>
+  ),
+  blockquote: ({ className, children }) => (
+    <Alert className={cn("text-primary-600 [&_li]:text-primary-600! [&_p]:text-primary-600!", className)}>
+      <AlertDescription>{children}</AlertDescription>
+    </Alert>
+  ),
+  code: ({ className, children, ...props }) => (
+    <code className={cn("markdown-code", className)} {...props}>
+      {children}
+    </code>
+  ),
+  pre: DocsCodeBlock,
+  table: ({ className, children, ...props }) => (
+    <MarketingTableFrame className="not-prose my-6">
+      <table className={cn("w-full border-separate border-spacing-0 text-sm", className)} {...props}>
+        {children}
+      </table>
+    </MarketingTableFrame>
+  ),
+  thead: ({ className, children, ...props }) => (
+    <thead className={cn("sticky top-[var(--table-sticky-top,0px)] z-10 bg-card", className)} {...props}>
+      {children}
+    </thead>
+  ),
+  tbody: ({ className, children, ...props }) => (
+    <tbody className={className} {...props}>
+      {children}
+    </tbody>
+  ),
+  tr: ({ className, children, ...props }) => (
+    <tr className={cn("transition-colors hover:bg-accent", className)} {...props}>
+      {children}
+    </tr>
+  ),
+  th: ({ className, children, ...props }) => (
+    <th
+      className={cn(
+        "min-w-[130px] bg-card px-6 py-3 text-left text-x-sm font-semibold text-foreground align-top",
+        className,
+      )}
+      {...props}
+    >
+      {children}
+    </th>
+  ),
+  td: ({ className, children, ...props }) => (
+    <td
+      className={cn("min-w-[130px] px-6 py-3 text-x-sm text-foreground align-top border-t border-border", className)}
+      {...props}
+    >
+      {children}
+    </td>
+  ),
+};
