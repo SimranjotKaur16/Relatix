@@ -1,0 +1,154 @@
+import { loader } from "fumadocs-core/source";
+import { toFumadocsSource } from "fumadocs-mdx/runtime/server";
+
+import { i18n, marketingI18n } from "./i18n";
+
+import {
+  about,
+  apiDocs,
+  apiOverview,
+  affiliate,
+  auth,
+  automation,
+  blog,
+  blogPosts,
+  compare,
+  comparePages,
+  contact,
+  docs,
+  featurePages,
+  features,
+  featuresAll,
+  forHub,
+  forPages,
+  helpAndFeedback,
+  homepage,
+  legal,
+  pricing,
+} from "@/.source/server";
+
+export const blogSource = loader({
+  baseUrl: "/blog",
+  i18n,
+  source: toFumadocsSource(blog, []),
+});
+
+export const blogPostsSource = loader({
+  baseUrl: "/blog",
+  i18n,
+  source: toFumadocsSource(blogPosts, []),
+});
+
+export const legalSource = loader({
+  baseUrl: "",
+  i18n,
+  source: toFumadocsSource(legal, []),
+});
+
+export const docsSource = loader({
+  baseUrl: "/docs",
+  i18n,
+  source: toFumadocsSource(docs, []),
+});
+
+export const apiDocsSource = loader({
+  baseUrl: "/docs/openapi",
+  i18n,
+  source: toFumadocsSource(apiDocs, []),
+});
+
+export const aboutSource = loader({
+  baseUrl: "/about",
+  i18n,
+  source: toFumadocsSource(about, []),
+});
+
+export const contactSource = loader({
+  baseUrl: "/contact",
+  i18n,
+  source: toFumadocsSource(contact, []),
+});
+
+export const apiOverviewSource = loader({
+  baseUrl: "/docs/openapi",
+  i18n,
+  source: toFumadocsSource(apiOverview, []),
+});
+
+export const compareSource = loader({
+  baseUrl: "/compare",
+  i18n,
+  source: toFumadocsSource(compare, []),
+});
+
+export const comparePagesSource = loader({
+  baseUrl: "/compare",
+  i18n,
+  source: toFumadocsSource(comparePages, []),
+});
+
+export const forSource = loader({
+  baseUrl: "/for",
+  i18n: marketingI18n,
+  source: toFumadocsSource(forHub, []),
+});
+
+export const pricingSource = loader({
+  baseUrl: "/pricing",
+  i18n: marketingI18n,
+  source: toFumadocsSource(pricing, []),
+});
+
+export const featurePagesSource = loader({
+  baseUrl: "/features",
+  i18n: marketingI18n,
+  source: toFumadocsSource(featurePages, []),
+});
+
+export const featuresSource = loader({
+  baseUrl: "/features",
+  i18n,
+  source: toFumadocsSource(features, []),
+});
+
+export const featuresAllSource = loader({
+  baseUrl: "/features",
+  i18n,
+  source: toFumadocsSource(featuresAll, []),
+});
+
+export const forPagesSource = loader({
+  baseUrl: "/for",
+  i18n: marketingI18n,
+  source: toFumadocsSource(forPages, []),
+});
+
+export const helpAndFeedbackSource = loader({
+  baseUrl: "/help-and-feedback",
+  i18n,
+  source: toFumadocsSource(helpAndFeedback, []),
+});
+
+export const homepageSource = loader({
+  baseUrl: "",
+  i18n: marketingI18n,
+  source: toFumadocsSource(homepage, []),
+});
+
+export const automationSource = loader({
+  baseUrl: "/n8n-crm",
+  i18n,
+  source: toFumadocsSource(automation, []),
+});
+
+export const authSource = loader({
+  baseUrl: "/auth",
+  i18n,
+  source: toFumadocsSource(auth, []),
+});
+
+export const affiliateSource = loader({
+  baseUrl: "/affiliate",
+  i18n,
+  source: toFumadocsSource(affiliate, []),
+});
