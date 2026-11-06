@@ -1,0 +1,1463 @@
+@import "tailwindcss" source(none);
+@import "tw-animate-css";
+@plugin '@tailwindcss/typography';
+
+@import "fumadocs-ui/css/preset.css";
+@import "fumadocs-ui/css/neutral.css";
+@import "fumadocs-openapi/css/preset.css";
+
+/* Inter's fallback, sized so a font swap does not reflow text. Liberation Sans and Arimo share
+   Arial's glyph widths, so the same overrides fit all three. See app/fonts.ts. */
+@font-face {
+  font-family: "Inter Fallback";
+  src: local("Arial"), local("ArialMT"), local("Liberation Sans"), local("LiberationSans"), local("Arimo");
+  ascent-override: 89.79%;
+  descent-override: 22.36%;
+  line-gap-override: 0%;
+  size-adjust: 107.89%;
+}
+
+/* Android ships none of those faces; Roboto needs its own overrides. */
+@font-face {
+  font-family: "Inter Fallback Roboto";
+  src: local("Roboto"), local("Roboto-Regular");
+  ascent-override: 89.59%;
+  descent-override: 22.31%;
+  line-gap-override: 0%;
+  size-adjust: 108.13%;
+}
+
+/* Item menus (components/ui/item-actions.tsx) split input by capability, not width: a fine pointer that can hover
+   reveals the trigger on hover; every other input (touch, pens, unknown) uses long press. */
+@custom-variant fine-hover (@media (hover: hover) and (pointer: fine));
+@custom-variant touch-input (@media not all and (hover: hover) and (pointer: fine));
+
+/* The noindex guide can invert one local specimen without changing the public page theme. */
+@custom-variant dark (
+  &:is(.dark *):not(:is([data-marketing-tone="inverse"], [data-marketing-tone="inverse"] *)),
+  &:is(:root:not(.dark) [data-marketing-tone="inverse"], :root:not(.dark) [data-marketing-tone="inverse"] *),
+  &:is(.light [data-marketing-tone="inverse"], .light [data-marketing-tone="inverse"] *)
+);
+
+@theme inline {
+  --color-scrim: var(--scrim);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary-soft-foreground: var(--primary-soft-foreground);
+  --color-secondary: var(--secondary);
+  --color-selected: var(--selected);
+  --color-tooltip: var(--tooltip);
+  --color-tooltip-foreground: var(--tooltip-foreground);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-placeholder: var(--placeholder);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-success-foreground: var(--success-foreground);
+  --color-warning: var(--warning);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-info: var(--info);
+  --color-info-foreground: var(--info-foreground);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-input: var(--input);
+  --color-input-background: var(--input-background);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-card: calc(var(--radius) + 12px);
+  --radius-panel: calc(var(--radius) + 16px);
+  --breakpoint-nav: 56rem;
+  --container-marketing: 80rem;
+  --container-live-preview: 84rem;
+  --aspect-hero: 16 / 9;
+  --aspect-social: 1200 / 630;
+  --ease-marketing: var(--marketing-ease);
+  --font-family-sans:
+    var(--font-sans), "Inter", ui-sans-serif, system-ui, sans-serif,
+    "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+  --font-family-mono:
+    var(--font-mono), "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo,
+    Consolas, "Liberation Mono", monospace;
+  --font-terminal:
+    ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --animate-collapsible-down: collapsible-down 200ms ease-out;
+  --animate-collapsible-up: collapsible-up 200ms ease-out;
+  --animate-accordion-down: collapsible-down 200ms ease-out;
+  --animate-accordion-up: collapsible-up 200ms ease-out;
+  --animate-fade-in: fade-in 300ms ease-out;
+  --animate-typing-dot: typing-dot 1.2s ease-in-out infinite;
+  --animate-timeline-grow: timeline-grow 300ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+  --animate-page-empty-in: page-empty-in 300ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+  --animate-page-result-in: page-result-in 220ms cubic-bezier(0.22, 1, 0.36, 1)
+    both;
+  --animate-page-loading-in: page-loading-in 160ms ease-out 180ms both;
+}
+
+@theme inline {
+  @keyframes enter {
+    from {
+      opacity: var(--tw-enter-opacity, 1);
+      transform: translate3d(var(--tw-enter-translate-x, 0), var(--tw-enter-translate-y, 0), 0)
+        scale3d(var(--tw-enter-scale, 1), var(--tw-enter-scale, 1), var(--tw-enter-scale, 1))
+        rotate(var(--tw-enter-rotate, 0));
+    }
+  }
+
+  @keyframes exit {
+    to {
+      opacity: var(--tw-exit-opacity, 1);
+      transform: translate3d(var(--tw-exit-translate-x, 0), var(--tw-exit-translate-y, 0), 0)
+        scale3d(var(--tw-exit-scale, 1), var(--tw-exit-scale, 1), var(--tw-exit-scale, 1))
+        rotate(var(--tw-exit-rotate, 0));
+    }
+  }
+}
+
+@keyframes timeline-grow {
+  from {
+    transform: scaleY(0);
+  }
+  to {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes typing-dot {
+  0%,
+  60%,
+  100% {
+    opacity: 0.25;
+  }
+  30% {
+    opacity: 1;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes page-empty-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes page-result-in {
+  from {
+    opacity: 0.82;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes page-loading-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes page-skeleton-build {
+  from {
+    opacity: 0.08;
+    transform: translateY(4px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes page-skeleton-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.62;
+  }
+}
+
+[data-page-skeleton-loading] {
+  --skeleton-group-delay: 0ms;
+  --skeleton-shape-delay: 0ms;
+}
+
+[data-page-skeleton-loading] [data-skeleton-group="1"] {
+  --skeleton-group-delay: 60ms;
+}
+
+[data-page-skeleton-loading] [data-skeleton-group="2"] {
+  --skeleton-group-delay: 120ms;
+}
+
+[data-page-skeleton-loading] [data-skeleton-group="3"] {
+  --skeleton-group-delay: 180ms;
+}
+
+[data-page-skeleton-loading] [data-skeleton-motion="1"] {
+  --skeleton-shape-delay: 70ms;
+}
+
+[data-page-skeleton-loading] [data-skeleton-motion="2"] {
+  --skeleton-shape-delay: 140ms;
+}
+
+[data-page-skeleton-loading] [data-skeleton-motion="3"] {
+  --skeleton-shape-delay: 210ms;
+}
+
+[data-page-skeleton-loading] [data-skeleton-motion] {
+  animation: page-skeleton-build 340ms cubic-bezier(0.22, 1, 0.36, 1)
+    calc(var(--skeleton-group-delay) + var(--skeleton-shape-delay)) backwards;
+}
+
+[data-page-skeleton-loading] [data-skeleton-breathe] {
+  animation:
+    page-skeleton-build 340ms cubic-bezier(0.22, 1, 0.36, 1)
+      calc(var(--skeleton-group-delay) + var(--skeleton-shape-delay)) backwards,
+    page-skeleton-pulse 1.6s ease-in-out
+      calc(900ms + var(--skeleton-group-delay) + var(--skeleton-shape-delay))
+      infinite;
+}
+
+[data-page-skeleton-empty] [data-skeleton-shape] {
+  opacity: 0.62;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-page-skeleton-loading] [data-skeleton-motion] {
+    animation: none;
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes focus-target-highlight {
+  0%,
+  60% {
+    box-shadow: 0 0 0 3px var(--ring);
+  }
+  100% {
+    box-shadow: 0 0 0 3px transparent;
+  }
+}
+
+[data-focus-highlight] {
+  animation: focus-target-highlight 2.4s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-focus-highlight] {
+    animation: none;
+    box-shadow: 0 0 0 3px var(--ring);
+  }
+}
+
+@keyframes collapsible-down {
+  from {
+    height: 0;
+  }
+  to {
+    height: var(--radix-collapsible-content-height);
+  }
+}
+
+@keyframes collapsible-up {
+  from {
+    height: var(--radix-collapsible-content-height);
+  }
+  to {
+    height: 0;
+  }
+}
+
+/* Overlay contract (CUS-60).
+   Every overlay derives its block-size budget, viewport gutter and safe-area padding
+   from these. Do not write raw vh/dvh or env(safe-area-inset-*) at a call site.
+
+   --viewport-block is upgraded to dvh via @supports rather than a two-declaration
+   fallback: a custom property accepts any token sequence, so `100dvh` would be stored
+   even where it is unsupported and then fail as invalid-at-computed-value-time on
+   max-height, which resolves to `none` — worse than no fallback at all.
+
+   --keyboard-inset stays 0px unless a visual-viewport listener sets it. Baking it in
+   now means iOS keyboard handling is additive later with no CSS change. */
+:root {
+  --scrim: #000000;
+  --viewport-block: 100vh;
+  --viewport-gutter: 1rem;
+  --keyboard-inset: 0px;
+
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+
+  /* Centred overlays pay a gutter on both block edges. */
+  --overlay-block-budget: calc(
+    var(--viewport-block) - var(--keyboard-inset) - var(--safe-top) -
+      var(--safe-bottom) - 2 * var(--viewport-gutter)
+  );
+
+  /* Edge-anchored overlays are flush against their near edge, so they pay a gutter on
+     the far edge only and absorb the near safe inset as padding rather than budget. */
+  --sheet-block-budget: calc(
+    var(--viewport-block) - var(--keyboard-inset) - var(--safe-top) -
+      var(--viewport-gutter)
+  );
+}
+
+@supports (height: 1dvh) {
+  :root {
+    --viewport-block: 100dvh;
+  }
+}
+
+/* Surface system (CUS-246).
+   Three mechanisms, because fill alone cannot express the whole interface. White is a
+   hard ceiling in light and near-black a hard floor in dark, so an opaque ladder runs
+   out after three levels, while the app nests five deep: field, card, card in a card,
+   page panel, app canvas.
+
+   FILL — three opaque rungs, structure only, never more than three.
+     canvas  --sidebar     the app shell behind everything, including the 8px gutter
+     panel   --background  the floating page body
+     raised  --card        card, popover, menu, dialog
+   Light fills retain visible opaque steps. Dark fills are deliberately compressed to
+   about 1.03:1 from canvas to page and 1.07:1 from page to card; borders carry the exact
+   edge while fill carries only coarse hierarchy. This keeps a long dark page from reading
+   as alternating stripes and makes the overall field quieter and darker.
+
+   BORDER — alpha, not opaque, so one value per tier is correct on all three rungs.
+     --border         ~1.18–1.22:1  container rims and rules: panel, card, table, separators
+     --input          ~1.32–1.37:1  a control edge at rest
+     --border-strong  ~1.68–1.74:1  control hover, selected, floating-surface rim
+   Two jobs only: delineation (where a container ends) and affordance (what you can
+   click into). Never hierarchy — that is primary, neutral, destructive, ghost. The
+   soft weight matches what shadcn, Linear and Primer ship and is short of WCAG 1.4.11
+   for a resting control; focus and aria-invalid carry that at 4.3:1 to 5.9:1.
+
+   WASH — translucent, so state composes at any nesting depth.
+     --input-background  a field sits at the RAISED rung, never below its parent
+     --muted             a subdued surface, relative to whatever it sits on
+     --accent            hover, moves toward the foreground
+     --selected          selected rows and items
+     (--secondary is NOT a wash: see the note below)
+     --placeholder       skeleton fill
+   Alphas remain theme-specific so state stays legible on the compressed dark ladder.
+
+   Tooltips follow the theme: a white surface with dark text in light, and the raised popover
+   surface with light text in dark. A --border rim keeps the edge on any rung, the arrow
+   shares the fill, and nested hints such as shortcut keys use the host theme's tokens.
+
+   --muted is a wash, not a rung. "Subdued" is inherently relative to the host, and a
+   host can be two rungs away: pinned to the canvas rung it read as a gentle stripe on a
+   light card and as a hole punched in a dark one, at the same measured contrast. Equal
+   contrast is not equal reading when the direction of travel differs from what the eye
+   expects. Its /20 to /60 call sites were taming a value that was too strong, exactly as
+   the border divisors were, and they go the same way. Hover belongs to --accent; the call
+   sites that were reaching for hover through --muted now say so. Anything needing an
+   opaque well rather than a tint uses --placeholder.
+
+   Nothing interactive is ever darker at rest than the surface it sits on. On a light
+   surface a darker fill is the disabled convention, so recessing an editable field or a
+   neutral button steals the one signal that "you may not change this" has left. shadcn,
+   Primer and Radix all avoid it in light. So --input-background and --secondary both sit
+   at the raised rung: a field or a neutral button lifts off the page panel and goes flat
+   inside a card, where its border alone identifies it. That leaves recession free for
+   read-only and disabled, which is where CUS-241 needs it.
+
+   A wash still moves toward the foreground, and that stays correct for STATE: a hover or
+   a selection must raise contrast against whatever it sits on, so it darkens in light and
+   lightens in dark. The distinction is resting elevation versus state, not light versus
+   dark. --accent and --selected are washes; --secondary is not. */
+:root,
+.light,
+.dark [data-marketing-tone="inverse"] {
+  --radius: 0.5rem;
+  --marketing-gutter: 1.25rem;
+  --marketing-gutter-lg: 2rem;
+  --marketing-column-gap: 0.5rem;
+  --marketing-duration: 200ms;
+  --marketing-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --background: #f6f6f8;
+  --foreground: #000000;
+  --card: #ffffff;
+  --card-foreground: #000000;
+  --popover: var(--card);
+  --popover-foreground: #000000;
+  --primary: #5e4ae3;
+  --primary-foreground: #ffffff;
+  /* The label on a soft-primary fill. --primary itself reads 4.09:1 on a bg-primary/20 tint
+     over the page ground in light and 3.95:1 in dark, both under the 4.5:1 body-text floor.
+     This is color-mix(in oklab, --primary 85%, --foreground): 85 parts of the theme's own
+     --primary to 15 parts of its --foreground, which keeps the hue and most of the chroma
+     while clearing the floor in both themes, at 5.62:1 light and 5.01:1 dark. */
+  --primary-soft-foreground: #4a3ab7;
+  --secondary: var(--card);
+  --secondary-foreground: #000000;
+  --selected: rgb(0 0 0 / 5.5%);
+  --tooltip: #ffffff;
+  --tooltip-foreground: #000000;
+  --muted: rgb(0 0 0 / 5.1%);
+  --muted-foreground: #656567;
+  --placeholder: rgb(0 0 0 / 7%);
+  --accent: rgb(0 0 0 / 2.4%);
+  --accent-foreground: #000000;
+  --destructive: #ff3b30;
+  --destructive-foreground: #ffffff;
+  --success: #34c759;
+  --success-foreground: #ffffff;
+  --warning: #ff9500;
+  --warning-foreground: #ffffff;
+  --info: #007aff;
+  --info-foreground: #ffffff;
+  --border: rgb(0 0 0 / 7.5%);
+  --border-strong: rgb(0 0 0 / 22.3%);
+  --input: rgb(0 0 0 / 12.9%);
+  --input-background: var(--card);
+  --ring: #5e4ae3;
+  --chart-default-1: #6b6b76;
+  --chart-default-2: #a3a3ad;
+  --chart-default-3: #d0d0d6;
+  --chart-default-text: #27272a;
+  --chart-default-rank-0: #6b6b76;
+  --chart-default-rank-1: #7b7b85;
+  --chart-default-rank-2: #8b8b95;
+  --chart-default-rank-3: #9c9ca5;
+  --chart-default-rank-4: #adadb5;
+  --chart-default-rank-5: #bfbfc5;
+  --chart-default-rank-6: #d0d0d6;
+  --chart-primary-1: #5e4ae3;
+  --chart-primary-2: #8f82ee;
+  --chart-primary-3: #c3bcf6;
+  --chart-primary-text: #2d236c;
+  --chart-primary-rank-0: #5e4ae3;
+  --chart-primary-rank-1: #6c62ec;
+  --chart-primary-rank-2: #7c78f4;
+  --chart-primary-rank-3: #8d8dfc;
+  --chart-primary-rank-4: #9fa1ff;
+  --chart-primary-rank-5: #b2b6ff;
+  --chart-primary-rank-6: #c6caff;
+  --chart-info-1: #2f6fdf;
+  --chart-info-2: #7aa6ef;
+  --chart-info-3: #bad2f8;
+  --chart-info-text: #173a7a;
+  --chart-info-rank-0: #2f6fdf;
+  --chart-info-rank-1: #4680e6;
+  --chart-info-rank-2: #5c91ee;
+  --chart-info-rank-3: #71a2f5;
+  --chart-info-rank-4: #87b2fb;
+  --chart-info-rank-5: #9cc2ff;
+  --chart-info-rank-6: #b2d2ff;
+  --chart-violet-1: #8a4fd1;
+  --chart-violet-2: #b48ae4;
+  --chart-violet-3: #dac6f3;
+  --chart-violet-text: #45206f;
+  --chart-violet-rank-0: #8a4fd1;
+  --chart-violet-rank-1: #9864d7;
+  --chart-violet-rank-2: #a578dd;
+  --chart-violet-rank-3: #b38de4;
+  --chart-violet-rank-4: #c1a2ea;
+  --chart-violet-rank-5: #ceb6f0;
+  --chart-violet-rank-6: #dccbf6;
+  --chart-secondary-1: #14918c;
+  --chart-secondary-2: #5fb5b1;
+  --chart-secondary-3: #a8d8d5;
+  --chart-secondary-text: #094644;
+  --chart-secondary-rank-0: #14918c;
+  --chart-secondary-rank-1: #3c9d98;
+  --chart-secondary-rank-2: #57a9a5;
+  --chart-secondary-rank-3: #6fb6b1;
+  --chart-secondary-rank-4: #85c2be;
+  --chart-secondary-rank-5: #9bcecb;
+  --chart-secondary-rank-6: #b0dbd8;
+  --chart-success-1: #2f9e6a;
+  --chart-success-2: #6cc196;
+  --chart-success-3: #b0dfc6;
+  --chart-success-text: #17543a;
+  --chart-success-rank-0: #2f9e6a;
+  --chart-success-rank-1: #4ba878;
+  --chart-success-rank-2: #62b387;
+  --chart-success-rank-3: #77bd96;
+  --chart-success-rank-4: #8bc8a5;
+  --chart-success-rank-5: #9fd2b4;
+  --chart-success-rank-6: #b2ddc3;
+  --chart-warning-1: #d8901f;
+  --chart-warning-2: #e9b765;
+  --chart-warning-3: #f3d7a6;
+  --chart-warning-text: #6b4308;
+  --chart-warning-rank-0: #d8901f;
+  --chart-warning-rank-1: #dc9a3f;
+  --chart-warning-rank-2: #dfa457;
+  --chart-warning-rank-3: #e3ae6b;
+  --chart-warning-rank-4: #e6b77e;
+  --chart-warning-rank-5: #e9c191;
+  --chart-warning-rank-6: #eccba3;
+  --chart-danger-1: #d5534e;
+  --chart-danger-2: #e68d89;
+  --chart-danger-3: #f1c1be;
+  --chart-danger-text: #6e211e;
+  --chart-danger-rank-0: #d5534e;
+  --chart-danger-rank-1: #dd6660;
+  --chart-danger-rank-2: #e57971;
+  --chart-danger-rank-3: #ec8b83;
+  --chart-danger-rank-4: #f29c94;
+  --chart-danger-rank-5: #f9ada6;
+  --chart-danger-rank-6: #febfb8;
+  --chart-1: var(--chart-primary-1);
+  --chart-2: var(--chart-secondary-1);
+  --chart-3: var(--chart-success-1);
+  --chart-4: var(--chart-warning-1);
+  --chart-5: var(--chart-danger-1);
+
+  --color-fd-background: #fafafa;
+  --color-fd-foreground: #000000;
+  --color-fd-muted: #f4f4f5;
+  --color-fd-muted-foreground: #656567;
+  --color-fd-popover: #ffffff;
+  --color-fd-popover-foreground: #000000;
+  --color-fd-card: #ffffff;
+  --color-fd-card-foreground: #000000;
+  --color-fd-border: #e7e7e7;
+  --color-fd-primary: #5e4ae3;
+  --color-fd-primary-foreground: #fff;
+  --color-fd-secondary: #f4f4f5;
+  --color-fd-secondary-foreground: #000000;
+  --color-fd-accent: color-mix(in srgb, #e3e3e6 50%, transparent);
+  --color-fd-accent-foreground: #000000;
+  --color-fd-ring: #d4d4d8;
+  --sidebar: #eeeef0;
+  --sidebar-foreground: #0a0a0b;
+  --sidebar-primary: #5e4ae3;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: rgb(0 0 0 / 5.5%);
+  --sidebar-accent-foreground: #0a0a0b;
+  --sidebar-border: var(--border);
+  --sidebar-ring: #5e4ae3;
+}
+
+.dark,
+:root:not(.dark) [data-marketing-tone="inverse"],
+.light [data-marketing-tone="inverse"] {
+  --background: #0d0d10;
+  --foreground: #fafafa;
+  --card: #151518;
+  --card-foreground: #fafafa;
+  --popover: var(--card);
+  --popover-foreground: #fafafa;
+  --primary: #7c6df2;
+  --primary-foreground: var(--background);
+  --primary-soft-foreground: #8c84f5;
+  --secondary: var(--card);
+  --secondary-foreground: #fafafa;
+  --selected: rgb(255 255 255 / 5.5%);
+  --tooltip: var(--popover);
+  --tooltip-foreground: var(--popover-foreground);
+  --muted: rgb(255 255 255 / 4.5%);
+  --muted-foreground: #a1a1a8;
+  --placeholder: rgb(255 255 255 / 7%);
+  --accent: rgb(255 255 255 / 2.7%);
+  --accent-foreground: #fafafa;
+  --destructive: #f87171;
+  --destructive-foreground: #ffffff;
+  --success: #34d399;
+  --success-foreground: #042f2e;
+  --warning: #fbbf24;
+  --warning-foreground: #451a03;
+  --info: #60a5fa;
+  --info-foreground: #082f49;
+  --border: rgb(255 255 255 / 7.5%);
+  --border-strong: rgb(255 255 255 / 18.1%);
+  --input: rgb(255 255 255 / 11.2%);
+  --input-background: var(--card);
+  --ring: #7c6df2;
+  --chart-default-1: #a1a1aa;
+  --chart-default-2: #71717a;
+  --chart-default-3: #4a4a52;
+  --chart-default-text: #f4f4f5;
+  --chart-default-rank-0: #a1a1aa;
+  --chart-default-rank-1: #95959d;
+  --chart-default-rank-2: #898990;
+  --chart-default-rank-3: #7d7d84;
+  --chart-default-rank-4: #717177;
+  --chart-default-rank-5: #65656b;
+  --chart-default-rank-6: #5a5a5f;
+  --chart-primary-1: #7c6df2;
+  --chart-primary-2: #5a4fb8;
+  --chart-primary-3: #3d3780;
+  --chart-primary-text: #ebe8fc;
+  --chart-primary-rank-0: #7c6df2;
+  --chart-primary-rank-1: #7568e3;
+  --chart-primary-rank-2: #6e63d4;
+  --chart-primary-rank-3: #685ec5;
+  --chart-primary-rank-4: #6159b7;
+  --chart-primary-rank-5: #5b54a8;
+  --chart-primary-rank-6: #554f9a;
+  --chart-info-1: #5b9bf5;
+  --chart-info-2: #3f72b8;
+  --chart-info-3: #2b4f80;
+  --chart-info-text: #dbe8fd;
+  --chart-info-rank-0: #5b9bf5;
+  --chart-info-rank-1: #5590e3;
+  --chart-info-rank-2: #4f85d2;
+  --chart-info-rank-3: #497ac0;
+  --chart-info-rank-4: #4370af;
+  --chart-info-rank-5: #3d669e;
+  --chart-info-rank-6: #385b8e;
+  --chart-violet-1: #b083f0;
+  --chart-violet-2: #8460b8;
+  --chart-violet-3: #594080;
+  --chart-violet-text: #f1e6fd;
+  --chart-violet-rank-0: #b083f0;
+  --chart-violet-rank-1: #a47be1;
+  --chart-violet-rank-2: #9973d2;
+  --chart-violet-rank-3: #8d6ac3;
+  --chart-violet-rank-4: #8162b4;
+  --chart-violet-rank-5: #765aa5;
+  --chart-violet-rank-6: #6a5296;
+  --chart-secondary-1: #2bb3ad;
+  --chart-secondary-2: #1f8581;
+  --chart-secondary-3: #175a57;
+  --chart-secondary-text: #d4efed;
+  --chart-secondary-rank-0: #2bb3ad;
+  --chart-secondary-rank-1: #2aa6a0;
+  --chart-secondary-rank-2: #289994;
+  --chart-secondary-rank-3: #278c87;
+  --chart-secondary-rank-4: #25807b;
+  --chart-secondary-rank-5: #23736f;
+  --chart-secondary-rank-6: #216764;
+  --chart-success-1: #3fbf85;
+  --chart-success-2: #2d8c62;
+  --chart-success-3: #1f5e43;
+  --chart-success-text: #d3f2e3;
+  --chart-success-rank-0: #3fbf85;
+  --chart-success-rank-1: #3bb07b;
+  --chart-success-rank-2: #36a270;
+  --chart-success-rank-3: #329366;
+  --chart-success-rank-4: #2d855c;
+  --chart-success-rank-5: #297753;
+  --chart-success-rank-6: #256a49;
+  --chart-warning-1: #e8a83c;
+  --chart-warning-2: #b07f2e;
+  --chart-warning-3: #735522;
+  --chart-warning-text: #fbebcf;
+  --chart-warning-rank-0: #e8a83c;
+  --chart-warning-rank-1: #d49936;
+  --chart-warning-rank-2: #c18b2f;
+  --chart-warning-rank-3: #ad7c29;
+  --chart-warning-rank-4: #9b6e23;
+  --chart-warning-rank-5: #88611d;
+  --chart-warning-rank-6: #765317;
+  --chart-danger-1: #e8706b;
+  --chart-danger-2: #ad524e;
+  --chart-danger-3: #723835;
+  --chart-danger-text: #fbdcda;
+  --chart-danger-rank-0: #e8706b;
+  --chart-danger-rank-1: #d76864;
+  --chart-danger-rank-2: #c7615c;
+  --chart-danger-rank-3: #b75a55;
+  --chart-danger-rank-4: #a7524e;
+  --chart-danger-rank-5: #974b47;
+  --chart-danger-rank-6: #874440;
+  --chart-1: var(--chart-primary-1);
+  --chart-2: var(--chart-secondary-1);
+  --chart-3: var(--chart-success-1);
+  --chart-4: var(--chart-warning-1);
+  --chart-5: var(--chart-danger-1);
+
+  --color-fd-background: #0e0e10;
+  --color-fd-foreground: #ffffff;
+  --color-fd-muted: #141416;
+  --color-fd-muted-foreground: #b2b2b5;
+  --color-fd-popover: #121214;
+  --color-fd-popover-foreground: #ffffff;
+  --color-fd-card: #121214;
+  --color-fd-card-foreground: #ffffff;
+  --color-fd-border: #1d1d1d;
+  --color-fd-primary: #5e4ae3;
+  --color-fd-primary-foreground: #fff;
+  --color-fd-secondary: #141416;
+  --color-fd-secondary-foreground: #ffffff;
+  --color-fd-accent: color-mix(in srgb, #26262a 30%, transparent);
+  --color-fd-accent-foreground: #ffffff;
+  --color-fd-ring: #65656b;
+  --sidebar: #08080b;
+  --sidebar-foreground: #e4e4e7;
+  --sidebar-primary: #7c6df2;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: rgb(255 255 255 / 5.5%);
+  --sidebar-accent-foreground: #fafafa;
+  --sidebar-border: var(--border);
+  --sidebar-ring: #7c6df2;
+}
+
+.dark [data-marketing-tone="inverse"] {
+  color-scheme: light;
+}
+
+:root:not(.dark) [data-marketing-tone="inverse"],
+.light [data-marketing-tone="inverse"] {
+  color-scheme: dark;
+}
+
+@layer base {
+  :root {
+    --fd-layout-width: 1600px;
+  }
+
+  :is(h1, h2, h3) {
+    overflow-wrap: break-word;
+    hyphens: auto;
+    hyphenate-limit-chars: 14 7 7;
+  }
+
+  * {
+    @apply border-border;
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
+  }
+
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background-color: var(--scrollbar-track);
+    border-radius: 9999px;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background-color: var(--scrollbar-thumb);
+    border-radius: 9999px;
+  }
+
+  html {
+    --scrollbar-thumb: #d4d4d8;
+    --scrollbar-track: #f4f4f500;
+  }
+
+  html[data-scroll-behavior="smooth"],
+  html[data-scroll-behavior="smooth"] [data-public-scrollport] {
+    scroll-behavior: smooth;
+  }
+
+  html.dark {
+    --scrollbar-thumb: #27272a;
+    --scrollbar-track: #12121400;
+  }
+
+  [tabindex="-1"]:focus,
+  [data-overlay-surface]:focus,
+  [data-radix-popper-content-wrapper] > :focus,
+  [role="dialog"]:focus,
+  [role="alertdialog"]:focus,
+  [role="menu"]:focus,
+  [role="listbox"]:focus,
+  main:focus {
+    outline: none;
+  }
+
+  body {
+    @apply bg-background text-foreground text-sm;
+    font-feature-settings: "cv11", "ss01", "ss03";
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .prose {
+    font-family: var(--font-family-sans);
+  }
+
+  .prose
+    :where(h1, h2, h3, h4, h5, h6):not(
+      :where([class~="not-prose"], [class~="not-prose"] *)
+    ) {
+    font-family: var(--font-family-sans);
+    font-weight: 700;
+  }
+
+  .prose
+    :where(strong, b):not(
+      :where([class~="not-prose"], [class~="not-prose"] *)
+    ) {
+    font-weight: 700;
+  }
+}
+
+g:focus,
+path:focus {
+  outline: none !important;
+}
+
+@keyframes rotatingAccentIn {
+  0% {
+    opacity: 0;
+    transform: translateY(100%);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes rotatingAccentOut {
+  0% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-100%);
+  }
+}
+
+.recharts-no-focus-outline .recharts-wrapper:focus,
+.recharts-no-focus-outline .recharts-wrapper:focus-visible,
+.recharts-no-focus-outline .recharts-surface:focus,
+.recharts-no-focus-outline .recharts-surface:focus-visible,
+.recharts-no-focus-outline .recharts-layer:focus,
+.recharts-no-focus-outline .recharts-layer:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+}
+
+@layer utilities {
+  .inline-link,
+  .inline-links a,
+  .prose :where(a):not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+    color: inherit;
+    text-decoration-color: currentColor;
+    text-decoration-line: underline;
+    text-decoration-thickness: from-font;
+    text-underline-offset: 0.2em;
+    transition:
+      opacity 150ms ease,
+      text-decoration-thickness 150ms ease;
+  }
+
+  .inline-link:hover,
+  .inline-link:focus-visible,
+  .inline-links a:hover,
+  .inline-links a:focus-visible,
+  .prose
+    :where(a:hover, a:focus-visible):not(
+      :where([class~="not-prose"], [class~="not-prose"] *)
+    ) {
+    text-decoration-thickness: 0.12em;
+  }
+
+  .inline-link:active,
+  .inline-links a:active,
+  .prose
+    :where(a:active):not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+    opacity: 0.7;
+  }
+
+  .inline-link:focus-visible,
+  .inline-links a:focus-visible,
+  .prose
+    :where(a:focus-visible):not(
+      :where([class~="not-prose"], [class~="not-prose"] *)
+    ) {
+    border-radius: 0.125rem;
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  .text-x-3xl {
+    @apply relative text-3xl md:text-4xl tracking-tight font-bold;
+  }
+
+  .text-x-2xl {
+    @apply relative text-xl md:text-2xl tracking-tight font-medium;
+  }
+
+  .text-x-xl {
+    @apply relative text-base md:text-xl tracking-tight font-medium;
+  }
+
+  .text-x-lg {
+    @apply relative text-lg tracking-tight font-medium;
+  }
+
+  .text-x-md {
+    @apply relative text-base tracking-tight;
+  }
+
+  .text-x-sm {
+    @apply relative text-sm tracking-tight;
+  }
+
+  .text-x-xs {
+    @apply relative text-xs tracking-tight;
+  }
+
+  .markdown-code {
+    @apply px-1.5 py-0.5 text-[0.9em] before:content-none after:content-none;
+  }
+
+  .text-subdued {
+    @apply relative text-muted-foreground;
+  }
+
+  .marketing-container {
+    @apply mx-auto w-full max-w-marketing;
+    padding-inline: var(--marketing-gutter);
+  }
+
+  .marketing-container-wide {
+    max-width: 96rem;
+  }
+
+  @media (width >= 40rem) {
+    .marketing-container {
+      padding-inline: var(--marketing-gutter-lg);
+    }
+  }
+
+  .marketing-section {
+    @apply w-full border-b border-border py-20 sm:py-24 lg:py-32;
+  }
+
+  [data-marketing-flow="continuous"]
+    .marketing-section:not([data-marketing-divider="explicit"]) {
+    border-bottom-width: 0;
+  }
+
+  .marketing-grid {
+    display: grid;
+    grid-template-columns: repeat(12, minmax(0, 1fr));
+    column-gap: var(--marketing-column-gap);
+  }
+
+  @media (width >= 40rem) {
+    .marketing-grid {
+      --marketing-column-gap: 1rem;
+    }
+  }
+
+  @media (width >= 64rem) {
+    .marketing-grid {
+      --marketing-column-gap: 1.5rem;
+    }
+  }
+
+  .marketing-section-flush {
+    @apply w-full py-20 sm:py-24 lg:py-32;
+  }
+
+  .marketing-transition {
+    transition-property:
+      color, background-color, border-color, opacity, transform;
+    transition-duration: var(--marketing-duration);
+    transition-timing-function: var(--marketing-ease);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .marketing-transition {
+      transition: none;
+    }
+  }
+
+  .text-display {
+    @apply font-medium text-balance;
+    font-size: clamp(2.5rem, 1.7325rem + 3.275vw, 5.25rem);
+    line-height: 0.98;
+    letter-spacing: -0.045em;
+    hyphens: auto;
+    overflow-wrap: break-word;
+  }
+
+  .text-hero {
+    @apply font-medium text-balance;
+    font-size: clamp(3rem, 6.5vw, 6rem);
+    line-height: 0.95;
+    letter-spacing: -0.055em;
+    hyphens: auto;
+    overflow-wrap: break-word;
+  }
+
+  .text-display-sm {
+    @apply font-medium text-balance;
+    font-size: clamp(2rem, 1.648rem + 1.502vw, 3rem);
+    line-height: 1.08;
+    letter-spacing: -0.03em;
+    hyphens: auto;
+    overflow-wrap: break-word;
+  }
+
+  .text-display,
+  .text-display-sm,
+  .text-hero,
+  .text-display-gradient {
+    background-image: linear-gradient(
+      to bottom,
+      var(--foreground),
+      color-mix(in oklab, var(--foreground) 65%, transparent)
+    );
+    background-clip: text;
+    color: transparent;
+  }
+
+  :is(.text-display, .text-display-sm, .text-hero, .text-display-gradient)
+    .text-muted-foreground {
+    color: transparent;
+  }
+
+  @media (forced-colors: active) {
+    .text-display,
+    .text-display-sm,
+    .text-hero,
+    .text-display-gradient {
+      background-image: none;
+      color: CanvasText;
+    }
+  }
+
+  .text-lede {
+    @apply text-base leading-relaxed text-muted-foreground sm:text-lg;
+    max-width: 44rem;
+  }
+
+  .text-eyebrow {
+    @apply text-xs font-medium tracking-[0.08em] text-muted-foreground uppercase;
+  }
+
+  .text-meta {
+    @apply text-xs leading-relaxed text-muted-foreground;
+  }
+
+  .interactive-surface {
+    @apply cursor-pointer no-underline transition-[background-color,box-shadow,transform] hover:bg-accent hover:no-underline active:scale-[0.97] motion-reduce:transition-none;
+  }
+
+  .interactive-surface-elevated {
+    @apply cursor-pointer no-underline transition-[background-color,box-shadow,transform] hover:bg-accent hover:no-underline hover:shadow-md active:scale-[0.97] motion-reduce:transition-none;
+  }
+
+  .prose
+    :where(
+      thead th:first-child,
+      tbody td:first-child,
+      tfoot td:first-child
+    ):not(:where([class~="not-prose"], [class~="not-prose"] *)) {
+    padding-inline-start: 1em !important;
+  }
+
+  .prose
+    :where(thead th:last-child, tbody td:last-child, tfoot td:last-child):not(
+      :where([class~="not-prose"], [class~="not-prose"] *)
+    ) {
+    padding-inline-end: 1em !important;
+  }
+}
+
+[data-rich-colors="true"][data-sonner-toast][data-type="error"] [data-button] {
+  background: var(--error-text);
+  color: var(--error-bg);
+}
+
+@keyframes homepage-reveal {
+  from {
+    opacity: 0;
+    transform: translateY(2rem) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@supports (animation-timeline: view()) {
+  @media (prefers-reduced-motion: no-preference) {
+    [data-reveal] {
+      animation: homepage-reveal linear both;
+      animation-timeline: view();
+      animation-range: entry 5% cover 28%;
+    }
+  }
+}
+
+.hero-marks {
+  --px: 0px;
+  --py: 0px;
+}
+
+.hero-mark {
+  position: absolute;
+  left: calc(50% + var(--x));
+  top: var(--y);
+  width: var(--s);
+  height: var(--s);
+  margin-left: calc(var(--s) / -2);
+  translate: calc(var(--px) * var(--depth)) calc(var(--py) * var(--depth));
+  transition: translate 0.7s cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+.hero-mark-card {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  border-radius: 25%;
+  animation:
+    hero-mark-in 1s cubic-bezier(0.2, 0.7, 0.2, 1) var(--d) both,
+    hero-mark-drift var(--dur) ease-in-out calc(var(--d) + 1s) infinite;
+  animation-play-state: running, paused;
+}
+
+.hero-marks[data-motion="running"] .hero-mark-card {
+  animation-play-state: running, running;
+}
+
+.hero-mark-card img {
+  width: 48%;
+  height: 48%;
+  object-fit: contain;
+}
+
+[data-hero-mark="claude"] {
+  --x: max(-36rem, -42vw);
+  --y: 10rem;
+  --s: 4.5rem;
+  --rot: -8deg;
+  --depth: 1.2;
+  --d: 380ms;
+  --dur: 10.5s;
+  --dx: 4px;
+  --dy: -12px;
+  --wob: -2deg;
+  --fx: -160px;
+  --fy: -40px;
+  --tint: rgb(217 119 87 / 0.22);
+}
+
+[data-hero-mark="gmail"] {
+  --x: max(-22rem, -26vw);
+  --y: 5.5rem;
+  --s: 3rem;
+  --rot: 6deg;
+  --depth: 0.6;
+  --d: 620ms;
+  --dur: 8.5s;
+  --dx: 2px;
+  --dy: -8px;
+  --wob: 3deg;
+  --fx: -40px;
+  --fy: -80px;
+}
+
+[data-hero-mark="linkedin"] {
+  --x: min(22rem, 26vw);
+  --y: 5.5rem;
+  --s: 3rem;
+  --rot: -5deg;
+  --depth: 0.6;
+  --d: 580ms;
+  --dur: 9.8s;
+  --dx: -2px;
+  --dy: -9px;
+  --wob: -3deg;
+  --fx: 40px;
+  --fy: -80px;
+  --tint: rgb(10 102 194 / 0.16);
+}
+
+[data-hero-mark="openai"] {
+  --x: min(36rem, 42vw);
+  --y: 10rem;
+  --s: 4.5rem;
+  --rot: 7deg;
+  --depth: 1.2;
+  --d: 460ms;
+  --dur: 9.2s;
+  --dx: -4px;
+  --dy: -10px;
+  --wob: 2deg;
+  --fx: 160px;
+  --fy: -40px;
+}
+
+[data-hero-mark="telegram"] {
+  --x: max(-30rem, -36vw);
+  --y: 33rem;
+  --s: 3.75rem;
+  --rot: 4deg;
+  --depth: 0.9;
+  --d: 540ms;
+  --dur: 11.5s;
+  --dx: 3px;
+  --dy: -9px;
+  --wob: -3deg;
+  --fx: -120px;
+  --fy: 80px;
+  --tint: rgb(42 171 238 / 0.16);
+}
+
+[data-hero-mark="n8n"] {
+  --x: min(30rem, 36vw);
+  --y: 33rem;
+  --s: 3.75rem;
+  --rot: -5deg;
+  --depth: 0.9;
+  --d: 700ms;
+  --dur: 7.8s;
+  --dx: -3px;
+  --dy: -11px;
+  --wob: 3deg;
+  --fx: 120px;
+  --fy: 80px;
+  --tint: rgb(234 75 113 / 0.16);
+}
+
+@media (width < 64rem) {
+  [data-hero-mark] {
+    --y: 1.25rem;
+    --s: 2.75rem;
+    --depth: 0.5;
+  }
+
+  [data-hero-mark="claude"] {
+    --x: -37vw;
+    --rot: -10deg;
+  }
+
+  [data-hero-mark="gmail"] {
+    --x: -12vw;
+    --y: 1.75rem;
+    --rot: -4deg;
+  }
+
+  [data-hero-mark="linkedin"] {
+    --x: 12vw;
+    --y: 1.75rem;
+    --rot: 5deg;
+  }
+
+  [data-hero-mark="openai"] {
+    --x: 37vw;
+    --rot: 8deg;
+  }
+
+  [data-hero-mark="telegram"],
+  [data-hero-mark="n8n"] {
+    display: none;
+  }
+}
+
+@media (40rem <= width < 64rem) {
+  [data-hero-mark] {
+    --s: 3rem;
+  }
+}
+
+@keyframes hero-mark-in {
+  from {
+    opacity: 0;
+    transform: translate(var(--fx), var(--fy)) rotate(calc(var(--rot) + 24deg))
+      scale(0.6);
+  }
+  to {
+    opacity: 1;
+    transform: translate(0, 0) rotate(var(--rot)) scale(1);
+  }
+}
+
+@keyframes hero-mark-drift {
+  0%,
+  100% {
+    transform: translate(0, 0) rotate(var(--rot));
+  }
+  50% {
+    transform: translate(var(--dx), var(--dy))
+      rotate(calc(var(--rot) + var(--wob)));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hero-mark-card {
+    animation: none;
+    transform: rotate(var(--rot));
+  }
+
+  .hero-mark {
+    translate: none;
+    transition: none;
+  }
+}
+
+@utility mark-glow {
+  background: radial-gradient(
+    circle at 30% 25%,
+    var(--tint, color-mix(in oklab, var(--foreground) 6%, transparent)),
+    color-mix(in oklab, var(--background) 88%, transparent) 65%
+  );
+  box-shadow:
+    0 0 0 1px color-mix(in oklab, var(--foreground) 10%, transparent),
+    0 14px 32px -16px rgb(0 0 0 / 0.14),
+    inset 0 1px 0 0 rgb(255 255 255 / 0.7);
+  backdrop-filter: blur(12px) saturate(160%);
+
+  @variant dark {
+    box-shadow:
+      0 0 0 1px color-mix(in oklab, var(--foreground) 10%, transparent),
+      0 14px 32px -14px rgb(0 0 0 / 0.5),
+      inset 0 1px 0 0 rgb(255 255 255 / 0.05);
+  }
+}
+
+@utility glass-surface {
+  border: 1px solid
+    color-mix(in oklab, var(--foreground) 12%, transparent);
+  background-color: color-mix(
+    in oklab,
+    var(--background) 55%,
+    transparent
+  );
+  box-shadow:
+    inset 0 1px 0 0 rgb(255 255 255 / 0.1),
+    0 12px 32px -14px rgb(0 0 0 / 0.4);
+  backdrop-filter: blur(24px) saturate(180%);
+}
+
+@utility floating-panel {
+  border: 1px solid
+    color-mix(in oklab, var(--foreground) 12%, transparent);
+  background-color: var(--popover);
+  box-shadow:
+    inset 0 1px 0 0 rgb(255 255 255 / 0.6),
+    0 24px 48px -20px rgb(0 0 0 / 0.18);
+
+  @variant dark {
+    box-shadow:
+      inset 0 1px 0 0 rgb(255 255 255 / 0.08),
+      0 24px 48px -16px rgb(0 0 0 / 0.45);
+  }
+}
+
+@keyframes step-progress-fill {
+  from {
+    transform: scaleY(0);
+  }
+
+  to {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes step-progress-on {
+  to {
+    border-color: var(--primary);
+    background-color: var(--primary);
+    color: var(--primary-foreground);
+  }
+}
+
+@supports (animation-timeline: view()) {
+  @media (prefers-reduced-motion: no-preference) {
+    [data-step-progress]::after {
+      position: absolute;
+      z-index: 0;
+      width: 1px;
+      inset-block: 0;
+      inset-inline-start: -1px;
+      background-color: var(--primary);
+      content: "";
+      transform-origin: top;
+      animation: step-progress-fill linear both;
+      animation-timeline: view();
+      animation-range: cover 20% cover 60%;
+    }
+
+    [data-step-progress] > li::before {
+      z-index: 1;
+      animation: step-progress-on linear both;
+      animation-timeline: view();
+      animation-range: cover 45% cover 50%;
+    }
+  }
+}
+
+@utility product-card {
+  border: 1px solid
+    color-mix(in oklab, var(--foreground) 10%, transparent);
+  background-color: var(--card);
+  box-shadow:
+    inset 0 1px 0 0 rgb(255 255 255 / 0.5),
+    0 2px 6px -2px rgb(0 0 0 / 0.08),
+    0 28px 72px -28px rgb(0 0 0 / 0.3);
+
+  @variant dark {
+    box-shadow:
+      inset 0 1px 0 0 rgb(255 255 255 / 0.07),
+      0 2px 6px -2px rgb(0 0 0 / 0.4),
+      0 36px 96px -32px rgb(0 0 0 / 0.85);
+  }
+}
+
+[data-marketing-flow="continuous"] [data-marketing-tone="canvas"] {
+  --section-fade-top: transparent;
+  --section-fade-bottom: transparent;
+
+  background-image:
+    linear-gradient(to bottom, var(--section-fade-top), transparent 7rem),
+    linear-gradient(to top, var(--section-fade-bottom), transparent 7rem);
+}
+
+[data-marketing-flow="continuous"]
+  :not([data-marketing-tone="canvas"], [data-marketing-tone="inverse"])
+  + [data-marketing-tone="canvas"] {
+  --section-fade-top: var(--background);
+}
+
+[data-marketing-flow="continuous"]
+  [data-marketing-tone="canvas"]:has(
+    + :not([data-marketing-tone="canvas"], [data-marketing-tone="inverse"])
+  ) {
+  --section-fade-bottom: var(--background);
+}
