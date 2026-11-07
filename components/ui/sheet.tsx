@@ -1,0 +1,181 @@
+"use client";
+
+import * as React from "react";
+import { XIcon } from "lucide-react";
+import { Dialog as SheetPrimitive } from "radix-ui";
+import { useTranslations } from "next-intl";
+
+import { cn } from "@/core/utils/cn";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./tooltip";
+import {
+  OVERLAY_CLOSE_CLASS,
+  OVERLAY_HEADER_ALIGNMENT_CLASS,
+  OVERLAY_SAFE_CLOSE_POSITION_CLASS,
+  OVERLAY_SCROLL_REGION,
+  isSheetHandoff,
+} from "./overlay-contract";
+
+const SHEET_HANDOFF_CLASS = "data-[state=closed]:animate-none! data-[state=open]:animate-none!";
+
+function Sheet({ ...props }: React.ComponentProps<typeof SheetPrimitive.Root>) {
+  return <SheetPrimitive.Root data-slot="sheet" {...props} />;
+}
+
+function SheetTrigger({ ...props }: React.ComponentProps<typeof SheetPrimitive.Trigger>) {
+  return <SheetPrimitive.Trigger data-slot="sheet-trigger" {...props} />;
+}
+
+function SheetClose({ ...props }: React.ComponentProps<typeof SheetPrimitive.Close>) {
+  return <SheetPrimitive.Close data-slot="sheet-close" {...props} />;
+}
+
+function SheetPortal({ ...props }: React.ComponentProps<typeof SheetPrimitive.Portal>) {
+  return <SheetPrimitive.Portal data-slot="sheet-portal" {...props} />;
+}
+
+function SheetOverlay({ className, ...props }: React.ComponentProps<typeof SheetPrimitive.Overlay>) {
+  return (
+    <SheetPrimitive.Overlay
+      className={cn(
+        "fixed inset-0 z-50 bg-scrim/30 data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:animate-in data-[state=open]:fade-in-0",
+        className,
+      )}
+      data-slot="sheet-overlay"
+      {...props}
+    />
+  );
+}
+
+function SheetContent({
+  className,
+  children,
+  side = "right",
+  showCloseButton = true,
+  overlayClassName,
+  ...props
+}: React.ComponentProps<typeof SheetPrimitive.Content> & {
+  side?: "top" | "right" | "bottom" | "left";
+  showCloseButton?: boolean;
+  overlayClassName?: string;
+}) {
+  const t = useTranslations();
+  const handoff = isSheetHandoff();
+
+  return (
+    <SheetPortal>
+      <SheetOverlay className={cn(handoff && SHEET_HANDOFF_CLASS, overlayClassName)} />
+
+      <SheetPrimitive.Content
+        className={cn(
+          "fixed z-50 flex flex-col gap-4 overflow-hidden bg-card shadow-lg outline-none transition ease-in-out data-[state=closed]:animate-out data-[state=closed]:duration-300 data-[state=open]:animate-in data-[state=open]:duration-500",
+          side === "right" &&
+            "inset-y-0 right-0 h-full w-3/4 border-l data-[state=closed]:slide-out-to-right data-[state=open]:slide-in-from-right sm:max-w-sm",
+          side === "left" &&
+            "inset-y-0 left-0 h-full w-3/4 border-r data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left sm:max-w-sm",
+          side === "top" &&
+            "inset-x-0 top-0 h-auto max-h-(--sheet-block-budget) border-b data-[state=closed]:slide-out-to-top data-[state=open]:slide-in-from-top",
+          side === "bottom" &&
+            "inset-x-0 bottom-0 h-auto max-h-(--sheet-block-budget) border-t data-[state=closed]:slide-out-to-bottom data-[state=open]:slide-in-from-bottom",
+          handoff && SHEET_HANDOFF_CLASS,
+          className,
+        )}
+        data-overlay-close={showCloseButton ? "" : undefined}
+        data-overlay-surface="sheet"
+        data-slot="sheet-content"
+        {...props}
+      >
+        {children}
+
+        {showCloseButton && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <SheetPrimitive.Close
+                className={cn(OVERLAY_CLOSE_CLASS, OVERLAY_SAFE_CLOSE_POSITION_CLASS)}
+                data-slot="sheet-close"
+              >
+                <XIcon />
+
+                <span className="sr-only">{t("Common.actions.close")}</span>
+              </SheetPrimitive.Close>
+            </TooltipTrigger>
+
+            <TooltipContent>{t("Common.actions.close")}</TooltipContent>
+          </Tooltip>
+        )}
+      </SheetPrimitive.Content>
+    </SheetPortal>
+  );
+}
+
+function SheetHeader({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      className={cn(
+        "flex shrink-0 flex-col gap-1.5 p-4 pt-[calc(1.5rem+var(--safe-top))] pr-[calc(1rem+var(--safe-right))] pl-[calc(1rem+var(--safe-left))]",
+        OVERLAY_HEADER_ALIGNMENT_CLASS,
+        className,
+      )}
+      data-slot="sheet-header"
+      {...props}
+    />
+  );
+}
+
+function SheetBody({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      className={cn(
+        OVERLAY_SCROLL_REGION,
+        "pr-[calc(1rem+var(--safe-right))] pl-[calc(1rem+var(--safe-left))]",
+        className,
+      )}
+      data-slot="sheet-body"
+      {...props}
+    />
+  );
+}
+
+function SheetFooter({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      className={cn(
+        "mt-auto flex shrink-0 flex-col gap-2 p-4 pr-[calc(1rem+var(--safe-right))] pb-[calc(1rem+var(--safe-bottom))] pl-[calc(1rem+var(--safe-left))]",
+        className,
+      )}
+      data-slot="sheet-footer"
+      {...props}
+    />
+  );
+}
+
+function SheetTitle({ className, ...props }: React.ComponentProps<typeof SheetPrimitive.Title>) {
+  return (
+    <SheetPrimitive.Title
+      className={cn("text-lg font-semibold text-foreground", className)}
+      data-slot="sheet-title"
+      {...props}
+    />
+  );
+}
+
+function SheetDescription({ className, ...props }: React.ComponentProps<typeof SheetPrimitive.Description>) {
+  return (
+    <SheetPrimitive.Description
+      className={cn("text-sm text-muted-foreground", className)}
+      data-slot="sheet-description"
+      {...props}
+    />
+  );
+}
+
+export {
+  Sheet,
+  SheetTrigger,
+  SheetClose,
+  SheetContent,
+  SheetHeader,
+  SheetBody,
+  SheetFooter,
+  SheetTitle,
+  SheetDescription,
+};
