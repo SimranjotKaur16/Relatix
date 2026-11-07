@@ -1,0 +1,731 @@
+"use client";
+
+import * as React from "react";
+import { cva, type VariantProps } from "class-variance-authority";
+import { PanelLeftIcon } from "lucide-react";
+import { Slot } from "radix-ui";
+import { useTranslations } from "next-intl";
+
+import { useIsMobile } from "@/hooks/use-mobile";
+import { cn } from "@/core/utils/cn";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { detectKeyboardPlatform } from "@/components/keyboard/key-matching";
+import { matchesShortcut } from "@/components/keyboard/shortcut-registry";
+import {
+  SIDEBAR_DEFAULT_WIDTH,
+  SIDEBAR_MAX_WIDTH,
+  SIDEBAR_MIN_WIDTH,
+  clampSidebarWidth,
+  keyboardSidebarWidth,
+  sidebarOpenCookie,
+  sidebarWidthCookie,
+} from "@/components/layout/sidebar-width";
+
+const SIDEBAR_WIDTH = "16rem";
+const SIDEBAR_WIDTH_MOBILE = "18rem";
+const SIDEBAR_WIDTH_ICON = "3rem";
+
+type SidebarContextProps = {
+  state: "expanded" | "collapsed";
+  open: boolean;
+  setOpen: (open: boolean) => void;
+  openMobile: boolean;
+  setOpenMobile: (open: boolean) => void;
+  isMobile: boolean;
+  toggleSidebar: () => void;
+  width: number | null;
+  setWidth: (width: number | null) => void;
+  previewWidth: (width: number | undefined) => void;
+};
+
+const sidebarWidthValue = (width: number | null) => (width === null ? SIDEBAR_WIDTH : `${width}px`);
+
+const SidebarContext = React.createContext<SidebarContextProps | null>(null);
+
+function useSidebar() {
+  const context = React.useContext(SidebarContext);
+  if (!context) throw new Error("useSidebar must be used within a SidebarProvider.");
+
+  return context;
+}
+
+function SidebarProvider({
+  defaultOpen = true,
+  defaultWidth,
+  open: openProp,
+  onOpenChange: setOpenProp,
+  className,
+  style,
+  children,
+  ...props
+}: React.ComponentProps<"div"> & {
+  defaultOpen?: boolean;
+  defaultWidth?: number;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+}) {
+  const isMobile = useIsMobile();
+  const [openMobile, setOpenMobile] = React.useState(false);
+  const wrapperRef = React.useRef<HTMLDivElement>(null);
+  const [width, setWidthState] = React.useState<number | null>(
+    defaultWidth === undefined ? null : clampSidebarWidth(defaultWidth),
+  );
+  const widthRef = React.useRef(width);
+
+  const setWidth = React.useCallback((value: number | null) => {
+    const next = value === null ? null : clampSidebarWidth(value);
+    widthRef.current = next;
+    setWidthState(next);
+    document.cookie = sidebarWidthCookie(next);
+  }, []);
+
+  const previewWidth = React.useCallback((value: number | undefined) => {
+    const wrapper = wrapperRef.current;
+    if (!wrapper) return;
+    if (value === undefined) delete wrapper.dataset.resizing;
+    else wrapper.dataset.resizing = "true";
+    wrapper.style.setProperty("--sidebar-width", sidebarWidthValue(value ?? widthRef.current));
+  }, []);
+
+  const [_open, _setOpen] = React.useState(defaultOpen);
+  const open = openProp ?? _open;
+  const setOpen = React.useCallback(
+    (value: boolean | ((value: boolean) => boolean)) => {
+      const openState = typeof value === "function" ? value(open) : value;
+      if (setOpenProp) setOpenProp(openState);
+      else _setOpen(openState);
+
+      document.cookie = sidebarOpenCookie(openState);
+    },
+    [setOpenProp, open],
+  );
+
+  const toggleSidebar = React.useCallback(() => {
+    return isMobile ? setOpenMobile((open) => !open) : setOpen((open) => !open);
+  }, [isMobile, setOpen, setOpenMobile]);
+
+  React.useEffect(() => {
+    const platform = detectKeyboardPlatform(navigator);
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (!matchesShortcut(event, "toggleSidebar", platform)) return;
+      event.preventDefault();
+      toggleSidebar();
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [toggleSidebar]);
+
+  const state = open ? "expanded" : "collapsed";
+
+  const contextValue = React.useMemo<SidebarContextProps>(
+    () => ({
+      state,
+      open,
+      setOpen,
+      isMobile,
+      openMobile,
+      setOpenMobile,
+      toggleSidebar,
+      width,
+      setWidth,
+      previewWidth,
+    }),
+    [state, open, setOpen, isMobile, openMobile, setOpenMobile, toggleSidebar, width, setWidth, previewWidth],
+  );
+
+  return (
+    <SidebarContext.Provider value={contextValue}>
+      <div
+        ref={wrapperRef}
+        className={cn(
+          "group/sidebar-wrapper flex h-svh w-full has-data-[variant=inset]:bg-sidebar data-resizing:cursor-col-resize data-resizing:select-none",
+          className,
+        )}
+        data-slot="sidebar-wrapper"
+        style={
+          {
+            "--sidebar-width": sidebarWidthValue(width),
+            "--sidebar-width-icon": SIDEBAR_WIDTH_ICON,
+            ...style,
+          } as React.CSSProperties
+        }
+        {...props}
+      >
+        {children}
+      </div>
+    </SidebarContext.Provider>
+  );
+}
+
+function Sidebar({
+  side = "left",
+  variant = "sidebar",
+  collapsible = "offcanvas",
+  className,
+  children,
+  ...props
+}: React.ComponentProps<"div"> & {
+  side?: "left" | "right";
+  variant?: "sidebar" | "floating" | "inset";
+  collapsible?: "offcanvas" | "icon" | "none";
+}) {
+  const t = useTranslations();
+  const { isMobile, state, openMobile, setOpenMobile } = useSidebar();
+
+  if (collapsible === "none") {
+    return (
+      <div
+        className={cn("flex h-full w-(--sidebar-width) flex-col bg-sidebar text-sidebar-foreground", className)}
+        data-slot="sidebar"
+        {...props}
+      >
+        {children}
+      </div>
+    );
+  }
+
+  if (isMobile) {
+    return (
+      <Sheet open={openMobile} onOpenChange={setOpenMobile} {...props}>
+        <SheetContent
+          className="w-(--sidebar-width) max-w-[85vw] gap-0 bg-sidebar p-0 text-sidebar-foreground [&>button]:hidden"
+          data-mobile="true"
+          data-sidebar="sidebar"
+          data-slot="sidebar"
+          side={side}
+          style={
+            {
+              "--sidebar-width": SIDEBAR_WIDTH_MOBILE,
+            } as React.CSSProperties
+          }
+        >
+          <SheetHeader className="sr-only">
+            <SheetTitle>{t("Common.sidebar.title")}</SheetTitle>
+
+            <SheetDescription>{t("Common.sidebar.description")}</SheetDescription>
+          </SheetHeader>
+
+          <div className="flex size-full flex-col">{children}</div>
+        </SheetContent>
+      </Sheet>
+    );
+  }
+
+  return (
+    <div
+      className="group peer hidden text-sidebar-foreground md:block"
+      data-collapsible={state === "collapsed" ? collapsible : ""}
+      data-side={side}
+      data-slot="sidebar"
+      data-state={state}
+      data-variant={variant}
+    >
+      <div
+        className={cn(
+          "relative w-(--sidebar-width) bg-transparent transition-[width] duration-200 ease-linear group-data-resizing/sidebar-wrapper:transition-none",
+          "group-data-[collapsible=offcanvas]:w-0",
+          "group-data-[side=right]:rotate-180",
+          variant === "floating" || variant === "inset"
+            ? "group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)+(--spacing(4)))]"
+            : "group-data-[collapsible=icon]:w-(--sidebar-width-icon)",
+        )}
+        data-slot="sidebar-gap"
+      />
+
+      <div
+        className={cn(
+          "fixed inset-y-0 z-10 hidden h-svh w-(--sidebar-width) transition-[left,right,width] duration-200 ease-linear group-data-resizing/sidebar-wrapper:transition-none md:flex",
+          side === "left"
+            ? "left-0 group-data-[collapsible=offcanvas]:left-[calc(var(--sidebar-width)*-1)]"
+            : "right-0 group-data-[collapsible=offcanvas]:right-[calc(var(--sidebar-width)*-1)]",
+          variant === "floating" || variant === "inset"
+            ? "p-2 group-data-[side=left]:pl-[calc(0.5rem+var(--safe-left))] group-data-[side=right]:pr-[calc(0.5rem+var(--safe-right))] group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)+(--spacing(4))+2px)]"
+            : "group-data-[collapsible=icon]:w-(--sidebar-width-icon) group-data-[side=left]:border-r group-data-[side=right]:border-l",
+          className,
+        )}
+        data-slot="sidebar-container"
+        {...props}
+      >
+        <div
+          className="flex size-full flex-col bg-sidebar group-data-[variant=floating]:rounded-lg group-data-[variant=floating]:border group-data-[variant=floating]:border-sidebar-border group-data-[variant=floating]:shadow-sm"
+          data-sidebar="sidebar"
+          data-slot="sidebar-inner"
+        >
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type SidebarDrag = { pointerId: number; startX: number; startWidth: number; width: number; moved: boolean };
+
+function SidebarResizeHandle({ className, ...props }: React.ComponentProps<"div">) {
+  const t = useTranslations();
+  const { isMobile, state, width, setWidth, previewWidth } = useSidebar();
+  const dragRef = React.useRef<SidebarDrag>();
+  const [dragWidth, setDragWidth] = React.useState<number>();
+
+  const endDrag = React.useCallback(
+    (handle: HTMLElement | null) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      dragRef.current = undefined;
+      if (handle?.hasPointerCapture?.(drag.pointerId)) handle.releasePointerCapture(drag.pointerId);
+      previewWidth(undefined);
+      setDragWidth(undefined);
+    },
+    [previewWidth],
+  );
+
+  React.useEffect(() => {
+    const cancelOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") endDrag(null);
+    };
+    window.addEventListener("keydown", cancelOnEscape);
+    return () => {
+      window.removeEventListener("keydown", cancelOnEscape);
+      endDrag(null);
+    };
+  }, [endDrag, isMobile, state]);
+
+  if (isMobile || state === "collapsed") return null;
+
+  const current = dragWidth ?? width ?? SIDEBAR_DEFAULT_WIDTH;
+
+  return (
+    // eslint-disable-next-line jsx-a11y/no-noninteractive-element-interactions -- an adjustable WAI-ARIA separator handles pointer and keyboard input
+    <div
+      aria-keyshortcuts="ArrowLeft ArrowRight Shift+ArrowLeft Shift+ArrowRight Home End Enter"
+      aria-label={t("Common.sidebar.resize")}
+      aria-orientation="vertical"
+      aria-valuemax={SIDEBAR_MAX_WIDTH}
+      aria-valuemin={SIDEBAR_MIN_WIDTH}
+      aria-valuenow={current}
+      className={cn(
+        "group/sidebar-resize absolute inset-y-0 right-0 z-20 flex w-2 cursor-col-resize touch-none justify-center outline-none select-none group-data-[side=right]:hidden group-data-[variant=inset]:inset-y-2",
+        className,
+      )}
+      data-sidebar="resize-handle"
+      data-slot="sidebar-resize-handle"
+      data-state={dragWidth === undefined ? undefined : "resizing"}
+      role="separator"
+      // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex -- an adjustable WAI-ARIA separator is keyboard focusable
+      tabIndex={0}
+      onDoubleClick={(event) => {
+        event.preventDefault();
+        endDrag(event.currentTarget);
+        setWidth(null);
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          setWidth(null);
+          return;
+        }
+        const next = keyboardSidebarWidth(event.key, event.shiftKey, current);
+        if (next === undefined) return;
+        event.preventDefault();
+        setWidth(next);
+      }}
+      onLostPointerCapture={(event) => endDrag(event.currentTarget)}
+      onPointerCancel={(event) => endDrag(event.currentTarget)}
+      onPointerDown={(event) => {
+        if (!event.isPrimary || (event.pointerType === "mouse" && event.button !== 0)) return;
+        event.preventDefault();
+        const container = event.currentTarget.closest<HTMLElement>("[data-slot=sidebar-container]");
+        const startWidth = clampSidebarWidth(container?.getBoundingClientRect().width || current);
+        dragRef.current = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startWidth,
+          width: startWidth,
+          moved: false,
+        };
+        event.currentTarget.setPointerCapture?.(event.pointerId);
+      }}
+      onPointerMove={(event) => {
+        const drag = dragRef.current;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        const next = clampSidebarWidth(drag.startWidth + event.clientX - drag.startX);
+        if (next === drag.width) return;
+        drag.width = next;
+        drag.moved = true;
+        previewWidth(next);
+        setDragWidth(next);
+      }}
+      onPointerUp={(event) => {
+        const drag = dragRef.current;
+        if (!drag || drag.pointerId !== event.pointerId) return;
+        event.stopPropagation();
+        if (drag.moved) setWidth(clampSidebarWidth(drag.startWidth + event.clientX - drag.startX));
+        endDrag(event.currentTarget);
+      }}
+      {...props}
+    >
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute top-1/2 left-1/2 h-8 w-1 -translate-1/2 rounded-full bg-transparent transition-colors duration-150 group-hover/sidebar-resize:bg-muted-foreground/50 group-focus-visible/sidebar-resize:bg-muted-foreground group-data-[state=resizing]/sidebar-resize:bg-transparent"
+      />
+
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-y-0 left-full w-0.5 -translate-x-1/2 bg-linear-to-b from-transparent via-foreground/60 to-transparent opacity-0 transition-opacity duration-150 group-data-[state=resizing]/sidebar-resize:opacity-100"
+      />
+    </div>
+  );
+}
+
+function SidebarTrigger({ className, onClick, ...props }: React.ComponentProps<typeof Button>) {
+  const t = useTranslations();
+  const { toggleSidebar } = useSidebar();
+
+  return (
+    <Button
+      className={cn("size-7", className)}
+      data-sidebar="trigger"
+      data-slot="sidebar-trigger"
+      size="icon"
+      variant="ghost"
+      onClick={(event) => {
+        if (props["aria-disabled"] === true || props["aria-disabled"] === "true") return;
+        onClick?.(event);
+        if (!event.defaultPrevented) toggleSidebar();
+      }}
+      {...props}
+    >
+      <PanelLeftIcon />
+
+      <span className="sr-only">{t("Common.sidebar.toggle")}</span>
+    </Button>
+  );
+}
+
+function SidebarInset({ className, ...props }: React.ComponentProps<"main">) {
+  return (
+    <main
+      className={cn(
+        "relative flex w-full flex-1 flex-col overflow-hidden bg-background",
+        "md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ml-0 md:peer-data-[variant=inset]:rounded-xl md:peer-data-[variant=inset]:border md:peer-data-[variant=inset]:border-border md:peer-data-[variant=inset]:shadow-sm md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ml-2",
+        className,
+      )}
+      data-slot="sidebar-inset"
+      {...props}
+    />
+  );
+}
+
+function SidebarInput({ className, ...props }: React.ComponentProps<typeof Input>) {
+  return (
+    <Input
+      className={cn("h-8 w-full bg-background shadow-none", className)}
+      data-sidebar="input"
+      data-slot="sidebar-input"
+      {...props}
+    />
+  );
+}
+
+function SidebarHeader({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      className={cn("flex flex-col gap-2 p-2", className)}
+      data-sidebar="header"
+      data-slot="sidebar-header"
+      {...props}
+    />
+  );
+}
+
+function SidebarFooter({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      className={cn("flex flex-col gap-2 p-2", className)}
+      data-sidebar="footer"
+      data-slot="sidebar-footer"
+      {...props}
+    />
+  );
+}
+
+function SidebarContent({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      className={cn(
+        "flex min-h-0 flex-1 flex-col gap-2 overflow-auto group-data-[collapsible=icon]:overflow-hidden",
+        className,
+      )}
+      data-sidebar="content"
+      data-slot="sidebar-content"
+      {...props}
+    />
+  );
+}
+
+function SidebarGroup({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      className={cn("relative flex w-full min-w-0 flex-col p-2", className)}
+      data-sidebar="group"
+      data-slot="sidebar-group"
+      {...props}
+    />
+  );
+}
+
+function SidebarGroupLabel({
+  className,
+  asChild = false,
+  ...props
+}: React.ComponentProps<"div"> & { asChild?: boolean }) {
+  const Comp = asChild ? Slot.Root : "div";
+
+  return (
+    <Comp
+      className={cn(
+        "flex h-8 shrink-0 items-center rounded-md px-2 text-xs font-medium text-sidebar-foreground/70 ring-sidebar-ring outline-hidden transition-[margin,opacity] duration-200 ease-linear focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
+        "group-data-[collapsible=icon]:-mt-8 group-data-[collapsible=icon]:opacity-0",
+        className,
+      )}
+      data-sidebar="group-label"
+      data-slot="sidebar-group-label"
+      {...props}
+    />
+  );
+}
+
+function SidebarGroupAction({
+  className,
+  asChild = false,
+  ...props
+}: React.ComponentProps<"button"> & { asChild?: boolean }) {
+  const Comp = asChild ? Slot.Root : "button";
+
+  return (
+    <Comp
+      className={cn(
+        "absolute top-3.5 right-3 flex aspect-square w-5 items-center justify-center rounded-md p-0 text-sidebar-foreground ring-sidebar-ring outline-hidden transition-transform hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
+        "after:absolute after:-inset-2 md:after:hidden",
+        "group-data-[collapsible=icon]:hidden",
+        className,
+      )}
+      data-sidebar="group-action"
+      data-slot="sidebar-group-action"
+      {...props}
+    />
+  );
+}
+
+function SidebarGroupContent({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      className={cn("w-full text-sm", className)}
+      data-sidebar="group-content"
+      data-slot="sidebar-group-content"
+      {...props}
+    />
+  );
+}
+
+function SidebarMenu({ className, ...props }: React.ComponentProps<"ul">) {
+  return (
+    <ul
+      className={cn("flex w-full min-w-0 flex-col gap-1", className)}
+      data-sidebar="menu"
+      data-slot="sidebar-menu"
+      {...props}
+    />
+  );
+}
+
+function SidebarMenuItem({ className, ...props }: React.ComponentProps<"li">) {
+  return (
+    <li
+      className={cn("group/menu-item relative", className)}
+      data-sidebar="menu-item"
+      data-slot="sidebar-menu-item"
+      {...props}
+    />
+  );
+}
+
+const sidebarMenuButtonVariants = cva(
+  "peer/menu-button flex w-full items-center gap-2 overflow-hidden rounded-md p-2 text-left text-sm ring-sidebar-ring outline-hidden transition-[width,height,padding] group-has-data-[sidebar=menu-action]/menu-item:pr-8 group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 data-[active=true]:bg-sidebar-accent data-[active=true]:font-medium data-[active=true]:text-sidebar-accent-foreground data-[state=open]:hover:bg-sidebar-accent data-[state=open]:hover:text-sidebar-accent-foreground [&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0",
+  {
+    variants: {
+      variant: {
+        default: "hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+        outline:
+          "bg-background shadow-[0_0_0_1px_var(--sidebar-border)] hover:bg-sidebar-accent hover:text-sidebar-accent-foreground hover:shadow-[0_0_0_1px_var(--sidebar-accent)]",
+      },
+      size: {
+        default: "h-8 text-sm",
+        sm: "h-7 text-xs",
+        lg: "h-12 text-sm group-data-[collapsible=icon]:p-0!",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+      size: "default",
+    },
+  },
+);
+
+function SidebarMenuButton({
+  asChild = false,
+  isActive = false,
+  variant = "default",
+  size = "default",
+  tooltip,
+  className,
+  ...props
+}: React.ComponentProps<"button"> & {
+  asChild?: boolean;
+  isActive?: boolean;
+  tooltip?: string | React.ComponentProps<typeof TooltipContent>;
+} & VariantProps<typeof sidebarMenuButtonVariants>) {
+  const Comp = asChild ? Slot.Root : "button";
+  const { isMobile, state } = useSidebar();
+
+  const button = (
+    <Comp
+      className={cn(sidebarMenuButtonVariants({ variant, size }), className)}
+      data-active={isActive}
+      data-sidebar="menu-button"
+      data-size={size}
+      data-slot="sidebar-menu-button"
+      {...props}
+    />
+  );
+
+  if (!tooltip) return button;
+
+  if (typeof tooltip === "string") {
+    tooltip = {
+      children: tooltip,
+    };
+  }
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{button}</TooltipTrigger>
+
+      <TooltipContent align="center" hidden={state !== "collapsed" || isMobile} side="right" {...tooltip} />
+    </Tooltip>
+  );
+}
+
+function SidebarMenuAction({
+  className,
+  asChild = false,
+  ...props
+}: React.ComponentProps<"button"> & {
+  asChild?: boolean;
+}) {
+  const Comp = asChild ? Slot.Root : "button";
+
+  return (
+    <Comp
+      className={cn(
+        "absolute top-1.5 right-1 flex aspect-square w-5 items-center justify-center rounded-md p-0 text-sidebar-foreground ring-sidebar-ring outline-hidden transition-transform peer-hover/menu-button:text-sidebar-accent-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
+        "after:absolute after:-inset-2 md:after:hidden",
+        "peer-data-[size=sm]/menu-button:top-1",
+        "peer-data-[size=default]/menu-button:top-1.5",
+        "peer-data-[size=lg]/menu-button:top-2.5",
+        "group-data-[collapsible=icon]:hidden peer-data-[active=true]/menu-button:text-sidebar-accent-foreground",
+        className,
+      )}
+      data-sidebar="menu-action"
+      data-slot="sidebar-menu-action"
+      {...props}
+    />
+  );
+}
+
+function SidebarMenuSub({ className, ...props }: React.ComponentProps<"ul">) {
+  return (
+    <ul
+      className={cn(
+        "mx-3.5 flex min-w-0 translate-x-px flex-col gap-1 border-l border-sidebar-border px-2.5 py-0.5",
+        "group-data-[collapsible=icon]:hidden",
+        className,
+      )}
+      data-sidebar="menu-sub"
+      data-slot="sidebar-menu-sub"
+      {...props}
+    />
+  );
+}
+
+function SidebarMenuSubItem({ className, ...props }: React.ComponentProps<"li">) {
+  return (
+    <li
+      className={cn("group/menu-sub-item relative", className)}
+      data-sidebar="menu-sub-item"
+      data-slot="sidebar-menu-sub-item"
+      {...props}
+    />
+  );
+}
+
+function SidebarMenuSubButton({
+  asChild = false,
+  size = "md",
+  isActive = false,
+  className,
+  ...props
+}: React.ComponentProps<"a"> & {
+  asChild?: boolean;
+  size?: "sm" | "md";
+  isActive?: boolean;
+}) {
+  const Comp = asChild ? Slot.Root : "a";
+
+  return (
+    <Comp
+      className={cn(
+        "flex h-7 min-w-0 -translate-x-px items-center gap-2 overflow-hidden rounded-md px-2 text-sidebar-foreground ring-sidebar-ring outline-hidden hover:bg-sidebar-accent hover:text-sidebar-accent-foreground focus-visible:ring-2 active:bg-sidebar-accent active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 [&>span:last-child]:truncate [&>svg]:size-4 [&>svg]:shrink-0 [&>svg]:text-sidebar-accent-foreground",
+        "data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground",
+        size === "sm" && "text-xs",
+        size === "md" && "text-sm",
+        "group-data-[collapsible=icon]:hidden",
+        className,
+      )}
+      data-active={isActive}
+      data-sidebar="menu-sub-button"
+      data-size={size}
+      data-slot="sidebar-menu-sub-button"
+      {...props}
+    />
+  );
+}
+
+export {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupAction,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarInput,
+  SidebarInset,
+  SidebarMenu,
+  SidebarMenuAction,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarMenuSub,
+  SidebarMenuSubButton,
+  SidebarMenuSubItem,
+  SidebarProvider,
+  SidebarResizeHandle,
+  SidebarTrigger,
+  sidebarMenuButtonVariants,
+  useSidebar,
+};
