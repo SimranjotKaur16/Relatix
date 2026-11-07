@@ -1,0 +1,20 @@
+"use client";
+
+import { useLocale, useTranslations } from "next-intl";
+import { useEffect } from "react";
+
+import { isRoutingLocale } from "@/i18n/locale-registry";
+import { useRootStore } from "@/core/stores/root-store.provider";
+
+export function TranslationSync() {
+  const locale = useLocale();
+  const t = useTranslations();
+  const { localeStore } = useRootStore();
+
+  useEffect(() => {
+    if (isRoutingLocale(locale)) localeStore.setLocale(locale);
+    localeStore.setTranslation(t);
+  }, [locale, t, localeStore]);
+
+  return null;
+}
