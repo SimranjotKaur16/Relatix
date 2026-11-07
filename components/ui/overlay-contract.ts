@@ -1,0 +1,48 @@
+import { buttonVariants } from "./button";
+
+export const OVERLAY_COLLISION_PADDING = 8;
+
+export const OVERLAY_RAISED_PANEL_LAYER_CLASS = "z-[60]";
+
+export const OVERLAY_TOPMOST_LAYER_CLASS = "z-[70]";
+
+export const OVERLAY_CLOSE_POSITION_CLASS = "top-[1.375rem] right-2";
+
+export const OVERLAY_SAFE_CLOSE_POSITION_CLASS =
+  "top-[calc(1.375rem+var(--safe-top))] right-[calc(0.5rem+var(--safe-right))]";
+
+export const OVERLAY_DRAWER_HANDLE_CLOSE_CLASS =
+  "group-data-[vaul-drawer-direction=bottom]/drawer-content:top-[2.875rem] group-data-[overlay-actions]/drawer-content:top-[1.375rem]! group-has-[[data-slot=drawer-header][data-header-actions]]/drawer-content:top-2! group-data-[vaul-drawer-direction=left]/drawer-content:top-2!";
+
+export const OVERLAY_DRAWER_HEADER_ACTIONS_CLASS = "flex-row items-center gap-2 py-2 pr-12";
+
+export const OVERLAY_ACTION_RAIL_CLASS = "absolute top-[1.375rem] right-12 z-10 flex min-h-8 items-center gap-2";
+
+export type OverlayIconControlVariant = "neutral" | "destructive";
+
+export function overlayIconControlClass(variant: OverlayIconControlVariant = "neutral") {
+  return buttonVariants({
+    variant: variant === "destructive" ? "ghostDestructive" : "ghost",
+    size: "icon-sm",
+    className: variant === "neutral" ? "text-muted-foreground" : undefined,
+  });
+}
+
+export const OVERLAY_CLOSE_CLASS = `absolute ${overlayIconControlClass()}`;
+
+const SHEET_HANDOFF_MS = 600;
+let sheetHandoffUntil = 0;
+
+export function handOffSheet() {
+  sheetHandoffUntil = Date.now() + SHEET_HANDOFF_MS;
+}
+
+export function isSheetHandoff() {
+  return Date.now() < sheetHandoffUntil;
+}
+
+export const OVERLAY_SIDE_SHEET_CLASS = "w-full gap-0 bg-background sm:max-w-[640px]";
+
+export const OVERLAY_HEADER_ALIGNMENT_CLASS = "text-left";
+
+export const OVERLAY_SCROLL_REGION = "min-h-0 flex-1 overflow-y-auto overscroll-contain";
