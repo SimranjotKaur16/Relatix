@@ -1,0 +1,238 @@
+"use client";
+
+import type { DateDisplayFormat } from "@/constants/date-format";
+
+import { useEffect, useState } from "react";
+import { observer } from "mobx-react-lite";
+import { CalendarIcon } from "lucide-react";
+import { useTranslations } from "next-intl";
+import { startOfMonth } from "date-fns";
+
+import { Calendar, focusCalendarDay } from "@/components/ui/calendar";
+import { Button } from "@/components/ui/button";
+import { FormLabel } from "./form-label";
+import { InputClearButton } from "./input-clear-button";
+import { DATE_PRESETS, localTimeValue, parseIsoDate, toLocalIso } from "./iso-date-values";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { Separator } from "@/components/ui/separator";
+import { TimeInput } from "./time-input";
+import { cn } from "@/core/utils/cn";
+import { useHydratedIntlStore } from "@/core/stores/use-hydrated-intl-store";
+
+import { useAppForm } from "./form-context";
+import { useFormFieldErrors } from "./use-form-field";
+
+type Props = {
+  id: string;
+  inputId?: string;
+  label?: string | null;
+  placeholder?: string;
+  required?: boolean;
+  displayFormat?: DateDisplayFormat;
+  dateOnly?: boolean;
+  clearable?: boolean;
+  value?: string;
+  onValueChange?: (value: string | undefined) => void;
+  onPicked?: () => void;
+  className?: string;
+  containerClassName?: string;
+  inline?: boolean;
+};
+
+export const FormIsoDatePicker = observer(
+  ({
+    id,
+    inputId,
+    label,
+    placeholder,
+    required,
+    displayFormat = "descriptiveLong",
+    dateOnly = true,
+    clearable = true,
+    value: controlledValue,
+    onValueChange,
+    onPicked,
+    className,
+    containerClassName,
+    inline = false,
+  }: Props) => {
+    const t = useTranslations();
+    const resolvedPlaceholder = placeholder ?? t("Common.inputs.datePlaceholder");
+    const store = useAppForm();
+    const intlStore = useHydratedIntlStore();
+
+    const raw = controlledValue ?? store?.getValue(id);
+    const domId = inputId ?? id;
+    const isoValue = typeof raw === "string" && raw !== "" ? raw : undefined;
+    const parsed = parseIsoDate(isoValue);
+    const { hasError } = useFormFieldErrors(id);
+    const isLoading = store?.isLoading ?? false;
+    const isReadOnly = !isLoading && (store?.isReadOnly ?? false);
+    const canEdit = !isReadOnly && !isLoading;
+
+    const resolvedLabel = label ?? undefined;
+
+    const formatter = dateOnly ? intlStore.dateFormatMap[displayFormat] : intlStore.dateTimeFormatMap[displayFormat];
+
+    const [currentMonth, setCurrentMonth] = useState<Date>(() => startOfMonth(parsed ?? new Date()));
+    const [open, setOpen] = useState(false);
+
+    useEffect(() => {
+      if (parsed) setCurrentMonth(startOfMonth(parsed));
+    }, [parsed?.getTime()]);
+
+    function commit(date: Date | undefined) {
+      if (isReadOnly || isLoading) return;
+
+      if (!date) {
+        if (onValueChange) onValueChange(undefined);
+        else store?.onChange(id, undefined);
+        return;
+      }
+
+      const next = toLocalIso(date, dateOnly);
+      if (onValueChange) onValueChange(next);
+      else store?.onChange(id, next);
+      setCurrentMonth(startOfMonth(date));
+    }
+
+    function handleSelect(next: Date | undefined) {
+      if (!next) {
+        commit(undefined);
+        return;
+      }
+
+      if (!dateOnly && parsed) next.setHours(parsed.getHours(), parsed.getMinutes(), parsed.getSeconds(), 0);
+
+      commit(next);
+      finishPick();
+    }
+
+    function finishPick() {
+      if (!dateOnly || !onPicked) return;
+      setOpen(false);
+      onPicked();
+    }
+
+    function handleTimeChange(value: string) {
+      const segments = value.split(":").map((p) => Number(p));
+      const [hours, minutes, seconds = 0] = segments;
+      if (![hours, minutes, seconds].every((n) => Number.isFinite(n))) return;
+      const base = parsed ?? new Date();
+      const next = new Date(base);
+      next.setHours(hours, minutes, seconds, 0);
+      commit(next);
+    }
+
+    function handlePreset(compute: (today: Date) => Date) {
+      const today = new Date();
+      const baseToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+      const next = compute(baseToday);
+      if (!dateOnly && parsed) next.setHours(parsed.getHours(), parsed.getMinutes(), parsed.getSeconds(), 0);
+      commit(next);
+      finishPick();
+    }
+
+    const timeValue = parsed ? localTimeValue(parsed) : "";
+
+    const panel = (
+      <>
+        <Calendar
+          disabled={isLoading}
+          mode="single"
+          month={currentMonth}
+          selected={parsed}
+          onMonthChange={setCurrentMonth}
+          onSelect={isReadOnly ? undefined : handleSelect}
+        />
+
+        {!dateOnly && (
+          <>
+            <Separator />
+
+            <div className="flex flex-col gap-2 p-3">
+              <FormLabel className="text-xs text-muted-foreground" htmlFor={`${domId}-time`}>
+                {t("Common.inputs.time")}
+              </FormLabel>
+
+              <TimeInput
+                disabled={isLoading}
+                id={`${domId}-time`}
+                use12Hour={intlStore.use12Hour}
+                value={timeValue}
+                onChange={handleTimeChange}
+              />
+            </div>
+          </>
+        )}
+
+        <Separator />
+
+        <div className="grid grid-cols-2 gap-2 p-3">
+          {DATE_PRESETS.map((preset) => (
+            <Button
+              key={preset.key}
+              disabled={isLoading}
+              size="sm"
+              type="button"
+              variant="secondary"
+              onClick={isReadOnly ? undefined : () => handlePreset(preset.compute)}
+            >
+              {t(`Common.datePresets.${preset.key}`)}
+            </Button>
+          ))}
+        </div>
+      </>
+    );
+
+    if (inline) return <div data-inline-date-picker="">{panel}</div>;
+
+    return (
+      <div className={cn("flex flex-col gap-1.5", containerClassName)}>
+        {resolvedLabel && (
+          <FormLabel fieldId={id} htmlFor={domId}>
+            {resolvedLabel}
+
+            {required ? <span className="text-destructive"> *</span> : null}
+          </FormLabel>
+        )}
+
+        <Popover open={canEdit && open} onOpenChange={canEdit ? setOpen : undefined}>
+          <PopoverTrigger asChild>
+            <Button
+              aria-disabled={isReadOnly || undefined}
+              aria-invalid={hasError}
+              className={cn(
+                "w-full justify-start text-left font-normal",
+                !parsed && "text-muted-foreground",
+                parsed && clearable && "active:scale-100",
+                className,
+              )}
+              data-field-state={isReadOnly ? "read-only" : undefined}
+              disabled={isLoading}
+              id={domId}
+              type="button"
+              variant="field"
+            >
+              <CalendarIcon className="mr-2 size-4 shrink-0" />
+
+              <span className="truncate flex-1">{parsed ? formatter(parsed) : resolvedPlaceholder}</span>
+
+              {parsed && clearable && !isReadOnly && !isLoading ? (
+                <InputClearButton onClear={() => commit(undefined)} />
+              ) : null}
+            </Button>
+          </PopoverTrigger>
+
+          <PopoverContent
+            align="start"
+            className="w-auto max-h-(--radix-popover-content-available-height) overflow-y-auto p-0"
+            onOpenAutoFocus={focusCalendarDay}
+          >
+            {panel}
+          </PopoverContent>
+        </Popover>
+      </div>
+    );
+  },
+);
