@@ -1,0 +1,242 @@
+"use client";
+
+import type { KeyboardEvent, ReactNode } from "react";
+import type { ChipColor } from "@/constants/chip-colors";
+
+import { useState } from "react";
+import { observer } from "mobx-react-lite";
+import { XIcon } from "lucide-react";
+import { useTranslations } from "next-intl";
+
+import { AppChip } from "@/components/chip/app-chip";
+import { FormLabel } from "./form-label";
+import { cn } from "@/core/utils/cn";
+import { useAppForm } from "./form-context";
+import { useFormFieldItemErrors, useResolvedFieldLabel } from "./use-form-field";
+
+type SharedProps = {
+  id: string;
+  inputId?: string;
+  label?: string | null;
+  placeholder?: string;
+  required?: boolean;
+  allowMultiple?: boolean;
+  renderChip?: (value: string, endContent: ReactNode, hasError: boolean) => ReactNode;
+  chipColor?: ChipColor;
+  onChipClick?: (value: string) => void;
+  disabled?: boolean;
+  readOnly?: boolean;
+  ariaLabelledBy?: string;
+  className?: string;
+  containerClassName?: string;
+};
+
+type Props = SharedProps &
+  (
+    | { arrayMode: true; value?: string[]; onValueChange?: (value: string[]) => void }
+    | { arrayMode?: false; value?: string; onValueChange?: (value: string | undefined) => void }
+  );
+
+function splitChipValue(value: unknown): string[] {
+  return typeof value === "string" ? value.split(",").filter((item) => item.trim() !== "") : [];
+}
+
+export const FormInputChips = observer(
+  ({
+    id,
+    inputId,
+    label,
+    placeholder,
+    required,
+    allowMultiple,
+    arrayMode,
+    renderChip,
+    chipColor,
+    value: controlledValue,
+    onValueChange,
+    onChipClick,
+    disabled,
+    readOnly,
+    ariaLabelledBy,
+    className,
+    containerClassName,
+  }: Props) => {
+    const t = useTranslations();
+    const [inputValue, setInputValue] = useState("");
+
+    const store = useAppForm();
+    const resolvedLabel = useResolvedFieldLabel(id, label);
+    const storeValue = store?.getValue(id) as string[] | string | undefined;
+    const fieldValue = controlledValue ?? storeValue;
+    const isDisabled = Boolean(disabled) || Boolean(store?.isLoading);
+    const isReadOnly = !isDisabled && (Boolean(readOnly) || Boolean(store?.isReadOnly));
+    const labelId = `${id}-label`;
+    const domId = inputId ?? id;
+    const hasInteractiveChips = isReadOnly && Boolean(onChipClick) && !isDisabled;
+
+    const chipValues = arrayMode ? (Array.isArray(fieldValue) ? fieldValue : []) : splitChipValue(fieldValue);
+
+    const { itemErrors: chipErrors, hasError } = useFormFieldItemErrors(id, chipValues.length);
+
+    function commit(next: string[]) {
+      if (isReadOnly || isDisabled) return;
+      if (arrayMode) {
+        if (onValueChange) (onValueChange as (value: string[]) => void)(next);
+        else store?.onChange(id, next);
+      } else {
+        const nextValue = allowMultiple ? next.join(",") : next[next.length - 1];
+        if (onValueChange) (onValueChange as (value: string | undefined) => void)(nextValue);
+        else store?.onChange(id, nextValue);
+      }
+      setInputValue("");
+    }
+
+    function commitInput() {
+      const trimmed = inputValue.trim();
+      if (!trimmed) return;
+      if (chipValues.includes(trimmed)) {
+        setInputValue("");
+        return;
+      }
+      commit([...chipValues, trimmed]);
+    }
+
+    function handleInputChange(value: string) {
+      if (!/[,;]/.test(value)) {
+        setInputValue(value);
+        return;
+      }
+      const parts = value
+        .split(/[,;]/)
+        .map((p) => p.trim())
+        .filter(Boolean);
+      const newChips = parts.filter((p) => !chipValues.includes(p));
+      if (newChips.length > 0) commit([...chipValues, ...newChips]);
+      else setInputValue("");
+    }
+
+    function onKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+      const key = event.key;
+
+      if (key === "Enter" || key === "," || key === ";") {
+        event.preventDefault();
+        commitInput();
+      }
+
+      if (key === "Backspace" && inputValue === "" && chipValues.length > 0) {
+        event.preventDefault();
+        commit(chipValues.slice(0, -1));
+      }
+    }
+
+    function handleRemove(item: string) {
+      commit(chipValues.filter((v) => v !== item));
+    }
+
+    return (
+      <div className={cn("space-y-1.5", containerClassName)}>
+        {resolvedLabel && (
+          <FormLabel
+            className={cn(hasError && "text-destructive")}
+            fieldId={id}
+            htmlFor={isReadOnly ? undefined : domId}
+            id={labelId}
+          >
+            {resolvedLabel}
+
+            {required ? <span className="text-destructive"> *</span> : null}
+          </FormLabel>
+        )}
+
+        <div
+          aria-disabled={isDisabled || undefined}
+          aria-invalid={hasError}
+          aria-label={isReadOnly && !resolvedLabel && !ariaLabelledBy ? (placeholder ?? id) : undefined}
+          aria-labelledby={isReadOnly ? (ariaLabelledBy ?? (resolvedLabel ? labelId : undefined)) : undefined}
+          aria-readonly={isReadOnly && !hasInteractiveChips ? true : undefined}
+          className={cn(
+            "flex min-h-9 w-full flex-wrap items-center gap-1 rounded-md border border-input bg-input-background px-2 py-1 text-sm shadow-xs",
+            "focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/50",
+            className,
+            isReadOnly && "cursor-[inherit]",
+            isDisabled && "cursor-not-allowed",
+            hasError &&
+              "border-destructive focus-within:border-destructive ring-destructive/20 focus-within:ring-destructive/20",
+          )}
+          id={isReadOnly ? domId : undefined}
+          role={isReadOnly ? (hasInteractiveChips ? "group" : "textbox") : undefined}
+          tabIndex={isReadOnly && !hasInteractiveChips ? 0 : undefined}
+        >
+          {chipValues.map((item, index) => {
+            const chipHasError = chipErrors[index] ?? false;
+            const removeButton =
+              isReadOnly || isDisabled ? undefined : (
+                <button
+                  aria-label={t("Common.actions.remove")}
+                  className="text-muted-foreground transition-[color,background-color,transform] hover:bg-muted hover:text-foreground active:scale-[0.97] motion-reduce:transition-none"
+                  tabIndex={-1}
+                  type="button"
+                  onClick={() => handleRemove(item)}
+                >
+                  <XIcon className="size-3" />
+                </button>
+              );
+            const chip = renderChip ? (
+              renderChip(item, removeButton, chipHasError)
+            ) : (
+              <AppChip
+                endContent={removeButton}
+                interactive={Boolean(onChipClick) && !isDisabled}
+                variant={chipHasError ? "destructive" : (chipColor ?? "secondary")}
+              >
+                {item}
+              </AppChip>
+            );
+
+            if (onChipClick && !isDisabled) {
+              return (
+                <span
+                  key={`${item}-${index}`}
+                  className="cursor-pointer rounded-md outline-none focus-visible:ring-[2px] focus-visible:ring-ring/70 focus-visible:ring-offset-1 focus-visible:ring-offset-background"
+                  role="button"
+                  tabIndex={0}
+                  onClick={(e) => {
+                    if ((e.target as HTMLElement).closest("button")) return;
+                    onChipClick(item);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      onChipClick(item);
+                    }
+                  }}
+                >
+                  {chip}
+                </span>
+              );
+            }
+
+            return <span key={`${item}-${index}`}>{chip}</span>;
+          })}
+
+          {!isReadOnly && (
+            <input
+              aria-invalid={hasError}
+              aria-labelledby={ariaLabelledBy}
+              className="flex-1 min-w-24 border-0 bg-transparent px-1 py-0.5 text-base outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed md:text-sm"
+              disabled={isDisabled}
+              id={domId}
+              placeholder={placeholder}
+              value={inputValue}
+              onBlur={commitInput}
+              onChange={(e) => handleInputChange(e.target.value)}
+              onKeyDown={onKeyDown}
+            />
+          )}
+        </div>
+      </div>
+    );
+  },
+);
+
+export type { Props as FormInputChipsProps };
