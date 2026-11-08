@@ -1,0 +1,161 @@
+"use client";
+
+import type { ReactNode } from "react";
+
+import { useId } from "react";
+
+import {
+  Drawer,
+  DrawerBody,
+  DrawerContent,
+  DrawerFooter,
+  DrawerHeader,
+  DrawerTitle,
+  DrawerTrigger,
+} from "@/components/ui/drawer";
+import {
+  Popover,
+  PopoverAnchor,
+  PopoverContent,
+  PopoverFooter,
+  PopoverHeader,
+  PopoverTitle,
+  PopoverTrigger,
+} from "@/components/ui/popover";
+import { OVERLAY_SCROLL_REGION } from "@/components/ui/overlay-contract";
+import { cn } from "@/core/utils/cn";
+import { useIsWiderThan } from "@/hooks/use-media-query";
+
+import { keepOpenForAssistantSurface, releaseFocusToAssistantSurface } from "./assistant-surface";
+import { OverlayDismissGuardContext, useOwnOverlayDismissGuard } from "./overlay-dismiss-guard";
+
+function focusOverlayContent(event: Event) {
+  if (event.currentTarget instanceof HTMLElement) event.currentTarget.focus({ preventScroll: true });
+}
+
+type Props = {
+  trigger: ReactNode;
+  anchor?: (trigger: ReactNode) => ReactNode;
+  title: ReactNode;
+  hideTitle?: boolean;
+  headerAction?: ReactNode;
+  children: ReactNode;
+  footer?: ReactNode;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  align?: "start" | "center" | "end";
+  drawerDirection?: "bottom" | "left";
+  popoverClassName?: string;
+  onEscapeKeyDown?: (event: KeyboardEvent) => void;
+  onOpenAutoFocus?: (event: Event) => void;
+  onCloseAutoFocus?: (event: Event) => void;
+};
+
+export function ResponsiveOverlay({
+  trigger,
+  anchor,
+  title,
+  hideTitle = false,
+  headerAction,
+  children,
+  footer,
+  open,
+  onOpenChange,
+  align = "start",
+  drawerDirection = "bottom",
+  popoverClassName,
+  onEscapeKeyDown,
+  onOpenAutoFocus = focusOverlayContent,
+  onCloseAutoFocus,
+}: Props) {
+  const isWide = useIsWiderThan("md");
+  const titleId = useId();
+  const dismissGuard = useOwnOverlayDismissGuard();
+
+  function handleOpenChange(next: boolean) {
+    if (!next && dismissGuard.shouldKeepOpen()) return;
+    onOpenChange(next);
+  }
+
+  function handleEscapeKeyDown(event: KeyboardEvent) {
+    keepOpenForAssistantSurface(event);
+    if (!event.defaultPrevented) onEscapeKeyDown?.(event);
+  }
+
+  const popoverTrigger = (
+    <PopoverTrigger asChild aria-expanded={open}>
+      {trigger}
+    </PopoverTrigger>
+  );
+  const drawerTrigger = (
+    <DrawerTrigger asChild aria-expanded={open}>
+      {trigger}
+    </DrawerTrigger>
+  );
+
+  return isWide ? (
+    <Popover open={open} onOpenChange={handleOpenChange}>
+      {anchor ? <PopoverAnchor asChild>{anchor(popoverTrigger)}</PopoverAnchor> : popoverTrigger}
+
+      <PopoverContent
+        align={align}
+        aria-labelledby={titleId}
+        className={cn(
+          "flex max-h-(--radix-popover-content-available-height) flex-col overflow-hidden p-0",
+          popoverClassName,
+        )}
+        onCloseAutoFocus={onCloseAutoFocus}
+        onEscapeKeyDown={handleEscapeKeyDown}
+        onInteractOutside={keepOpenForAssistantSurface}
+        onOpenAutoFocus={onOpenAutoFocus}
+      >
+        <PopoverHeader
+          className={cn(
+            "shrink-0 p-3",
+            headerAction && "flex-row items-center gap-2 py-1.5 pr-1.5",
+            hideTitle && !headerAction && "sr-only",
+          )}
+        >
+          <PopoverTitle className={cn(headerAction && "min-w-0 flex-1 truncate")} id={titleId}>
+            {title}
+          </PopoverTitle>
+
+          {headerAction}
+        </PopoverHeader>
+
+        <OverlayDismissGuardContext.Provider value={dismissGuard.guard}>
+          <div className={cn(OVERLAY_SCROLL_REGION)}>{children}</div>
+
+          {footer && <PopoverFooter className="p-3">{footer}</PopoverFooter>}
+        </OverlayDismissGuardContext.Provider>
+      </PopoverContent>
+    </Popover>
+  ) : (
+    <Drawer direction={drawerDirection} open={open} repositionInputs={false} onOpenChange={handleOpenChange}>
+      {anchor ? anchor(drawerTrigger) : drawerTrigger}
+
+      <DrawerContent
+        aria-describedby={undefined}
+        data-overlay-actions={headerAction ? "" : undefined}
+        onBlur={releaseFocusToAssistantSurface}
+        onCloseAutoFocus={onCloseAutoFocus}
+        onEscapeKeyDown={handleEscapeKeyDown}
+        onInteractOutside={keepOpenForAssistantSurface}
+        onOpenAutoFocus={onOpenAutoFocus}
+      >
+        <DrawerHeader
+          actions={headerAction}
+          className="group-data-[vaul-drawer-direction=left]/drawer-content:flex-row group-data-[vaul-drawer-direction=left]/drawer-content:items-center group-data-[vaul-drawer-direction=left]/drawer-content:py-3 group-data-[vaul-drawer-direction=left]/drawer-content:pr-12"
+        >
+          <DrawerTitle className={cn("min-w-0 truncate", headerAction && "flex-1")}>{title}</DrawerTitle>
+        </DrawerHeader>
+
+        <OverlayDismissGuardContext.Provider value={dismissGuard.guard}>
+          <DrawerBody className="px-0 pb-4">{children}</DrawerBody>
+
+          {footer && <DrawerFooter className="flex-col-reverse">{footer}</DrawerFooter>}
+        </OverlayDismissGuardContext.Provider>
+      </DrawerContent>
+    </Drawer>
+  );
+}
