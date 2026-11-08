@@ -1,0 +1,109 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it } from "vitest";
+
+import { DashboardPageSkeleton } from "@/app/[locale]/(protected)/w/[workspace]/dashboard/components/dashboard-page-skeleton";
+import { InboxPageSkeleton } from "@/app/[locale]/(protected)/w/[workspace]/inbox/components/inbox-page-skeleton";
+import { SubscriptionPageSkeleton } from "@/app/[locale]/(protected)/w/[workspace]/settings/(workspace)/components/subscription/subscription-page-skeleton";
+import { OnboardingPageSkeleton } from "@/app/[locale]/(protected)/onboarding/wizard/components/onboarding-page-skeleton";
+import {
+  ApiKeysPageSkeleton,
+  ConnectedAccountsPageSkeleton,
+} from "@/app/[locale]/(protected)/w/[workspace]/settings/(account)/components/profile-resource-page-skeleton";
+import { ProfileSettingsPageSkeleton } from "@/app/[locale]/(protected)/w/[workspace]/settings/(account)/components/profile-settings-page-skeleton";
+import { EntityDetailPageSkeleton } from "@/components/entity-detail/entity-detail-page-skeleton";
+import { CenteredCardPageSkeleton } from "@/components/shared/centered-card-page-skeleton";
+
+const count = (markup: string, marker: string) => markup.split(marker).length - 1;
+
+describe("page skeleton families", () => {
+  it.each([
+    ["dashboard", DashboardPageSkeleton],
+    ["detail", EntityDetailPageSkeleton],
+    ["settings-profile", ProfileSettingsPageSkeleton],
+    ["subscription", SubscriptionPageSkeleton],
+    ["api-keys", ApiKeysPageSkeleton],
+    ["connected-accounts", ConnectedAccountsPageSkeleton],
+    ["centered-card", CenteredCardPageSkeleton],
+    ["onboarding", OnboardingPageSkeleton],
+  ] as const)("renders animated and static %s geometry from the same component", (_name, SkeletonComponent) => {
+    const loading = renderToStaticMarkup(createElement(SkeletonComponent));
+    const empty = renderToStaticMarkup(createElement(SkeletonComponent, { animated: false }));
+
+    expect(loading).toContain('data-page-skeleton-loading="true"');
+    expect(empty).toContain('data-page-skeleton-empty="true"');
+    expect(loading).toContain("data-skeleton-shape");
+    expect(empty).toContain("data-skeleton-shape");
+    expect(empty).not.toContain("data-page-skeleton-loading");
+  });
+
+  it.each(["split", "list", "transcript"] as const)("owns the %s inbox geometry", (view) => {
+    const loading = renderToStaticMarkup(createElement(InboxPageSkeleton, { view }));
+    const empty = renderToStaticMarkup(createElement(InboxPageSkeleton, { animated: false, view }));
+
+    expect(loading).toContain(`data-skeleton-view="${view}"`);
+    expect(loading).toContain('data-page-skeleton-loading="true"');
+    expect(empty).toContain('data-page-skeleton-empty="true"');
+  });
+
+  it("matches the responsive entity-detail panel and flat field geometry", () => {
+    const detail = renderToStaticMarkup(
+      createElement(EntityDetailPageSkeleton, {
+        showActivityPanel: true,
+        showSummary: true,
+        summaryItemCount: 12,
+      }),
+    );
+
+    expect(detail).toContain("@container/detail size-full min-h-0");
+    expect(detail).toContain("data-entity-detail-skeleton-shell");
+    expect(detail).toContain("data-entity-detail-skeleton-summary");
+    expect(detail).toContain('data-summary-variant="chip-row"');
+    expect(detail).toContain("flex flex-wrap items-center gap-1");
+    expect(detail).toContain("h-[22px] rounded-md");
+    expect(detail).not.toContain("rounded-md border border-border/60 bg-card/40 px-3 py-2");
+    expect(count(detail, "data-summary-panel-divider")).toBe(0);
+    expect(count(detail, 'data-summary-overflow="true"')).toBe(0);
+    expect(detail).toContain("overflow-y-auto @6xl/detail:overflow-y-visible");
+    expect(detail).toContain("data-entity-detail-skeleton-tabs");
+    expect(detail).toContain("h-13 shrink-0 border-b border-border bg-background @6xl/detail:hidden");
+    expect(detail).toContain("grid size-full grid-flow-col auto-cols-fr");
+    expect(detail).not.toContain("-mx-4 -mt-4 flex flex-col");
+    expect(detail).toContain("flex flex-col gap-4");
+    expect(detail).not.toContain("@6xl/detail:mt-0");
+    expect(count(detail, "data-entity-detail-skeleton-section")).toBe(0);
+    expect(detail).toContain("@6xl/detail:grid-cols-[minmax(0,1fr)_360px]");
+    expect(detail).not.toContain("minmax(0,2fr)");
+  });
+
+  it("matches profile and subscription settings geometry without fabricated branches", () => {
+    const profile = renderToStaticMarkup(createElement(ProfileSettingsPageSkeleton));
+    const subscription = renderToStaticMarkup(createElement(SubscriptionPageSkeleton));
+
+    expect(profile).toContain("data-profile-settings-avatar");
+    expect(count(profile, "data-settings-field")).toBe(7);
+    expect(count(subscription, "data-settings-field")).toBe(1);
+    expect(subscription).toContain("data-subscription-plan-field");
+    expect(subscription).toContain("data-subscription-status-chip");
+    expect(subscription).toContain("border-border bg-background");
+    expect(subscription).toContain("shadow-none");
+    expect(subscription).not.toContain("bg-muted");
+    expect(subscription).not.toContain("data-subscription-plan-picker");
+  });
+
+  it("uses onboarding's profile-step geometry instead of the generic guarded card", () => {
+    const onboarding = renderToStaticMarkup(createElement(OnboardingPageSkeleton));
+
+    expect(onboarding).toContain(
+      "linear-gradient(to_right,var(--border)_1px,transparent_1px),linear-gradient(to_bottom,var(--border)_1px,transparent_1px)",
+    );
+    expect(onboarding).toContain("[background-size:56px_56px]");
+    expect(onboarding).not.toContain("radial-gradient(circle at 1px 1px, currentColor 1px, transparent 0)");
+    expect(onboarding).toContain("data-onboarding-profile-skeleton");
+    expect(count(onboarding, "data-onboarding-field")).toBe(4);
+    expect(onboarding).toContain("data-onboarding-checkbox");
+    expect(onboarding).toContain("data-onboarding-continue");
+    expect(onboarding).not.toContain("data-centered-card-hero");
+    expect(onboarding).not.toContain("data-centered-card-footer");
+  });
+});
