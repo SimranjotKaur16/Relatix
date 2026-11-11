@@ -1,0 +1,465 @@
+import type { ActiveWorkspaceService } from "@/features/workspace/active-workspace.service";
+import type { TenantUser } from "@/features/user/user.schema";
+import type { AuthService } from "../auth.service";
+import type { FindUserRepo } from "../../user/user.service";
+import type { RouteGuardCompanyRepo } from "../route-guard-company.repo";
+import type { AccessOptions } from "../route-guard.service";
+import type { GetLegalStatusInteractor } from "@/features/legal/get-legal-status.interactor";
+
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const mockEnv = vi.hoisted(() => ({
+  APP_MODE: "cloud" as "cloud" | "demo" | "self-hosted",
+}));
+
+vi.mock("@/env", () => ({ env: mockEnv }));
+
+import { Action, Resource, Status, SubscriptionStatus } from "@/generated/prisma";
+
+import {
+  accessRedirectForAccountState,
+  RouteGuardService,
+  unauthenticatedRedirectForAccountState,
+} from "../route-guard.service";
+
+const PAST = new Date(Date.now() - 48 * 60 * 60 * 1000);
+const FUTURE = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+const mocks = {
+  existsUnscoped: vi.fn(),
+  getSession: vi.fn(),
+  findAuthUserCompanyIdUnscoped: vi.fn(),
+  findAuthUserAccountStateUnscoped: vi.fn(),
+  findCurrentUserUnscoped: vi.fn(),
+  getSubscriptionOrThrowUnscoped: vi.fn(),
+  getLegalStatus: vi.fn(),
+  hasLeftMembershipUnscoped: vi.fn(),
+};
+
+function makeService() {
+  return new RouteGuardService(
+    { getSession: mocks.getSession } as unknown as AuthService,
+    {
+      findAuthUserCompanyIdUnscoped: mocks.findAuthUserCompanyIdUnscoped,
+      findAuthUserAccountStateUnscoped: mocks.findAuthUserAccountStateUnscoped,
+      findCurrentUserUnscoped: mocks.findCurrentUserUnscoped,
+      hasLeftMembershipUnscoped: mocks.hasLeftMembershipUnscoped,
+    } as unknown as FindUserRepo,
+    {
+      existsUnscoped: mocks.existsUnscoped,
+      getSubscriptionOrThrowUnscoped: mocks.getSubscriptionOrThrowUnscoped,
+    } as unknown as RouteGuardCompanyRepo,
+    { invoke: mocks.getLegalStatus } as unknown as GetLegalStatusInteractor,
+    {
+      resolveMembership: (session: { user: { email: string } }) => mocks.findCurrentUserUnscoped(session.user.email),
+    } as unknown as ActiveWorkspaceService,
+  );
+}
+
+async function resolveAccess(options?: AccessOptions) {
+  return accessRedirectForAccountState(await makeService().resolveAccountState(), options);
+}
+
+async function resolveUnauthenticated() {
+  return unauthenticatedRedirectForAccountState(await makeService().resolveAccountState());
+}
+
+function session(overrides: Record<string, unknown> = {}) {
+  return {
+    user: {
+      createdAt: new Date(),
+      email: "max@example.com",
+      emailVerified: true,
+      id: "auth-user-1",
+      name: "Max Example",
+      ...overrides,
+    },
+  };
+}
+
+function user(overrides: Record<string, unknown> = {}): TenantUser {
+  return {
+    id: "user-1",
+    email: "max@example.com",
+    companyId: "company-1",
+    status: Status.active,
+    onboardingWizardCompletedAt: new Date(),
+    role: { isSystemRole: true, permissions: [] },
+    ...overrides,
+  } as unknown as TenantUser;
+}
+
+function subscription(status: SubscriptionStatus, trialEndDate: Date | null = null) {
+  return { status, trialEndDate };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockEnv.APP_MODE = "cloud";
+  mocks.getSession.mockResolvedValue(session());
+  mocks.findAuthUserCompanyIdUnscoped.mockResolvedValue(null);
+  mocks.findAuthUserAccountStateUnscoped.mockImplementation(async (userId: string) => {
+    const companyId = await mocks.findAuthUserCompanyIdUnscoped(userId);
+    if (companyId === undefined) return undefined;
+    const current = await mocks.getSession.mock.results.at(-1)?.value;
+    return { companyId, emailVerified: current?.user?.emailVerified ?? false };
+  });
+  mocks.existsUnscoped.mockResolvedValue(true);
+  mocks.findCurrentUserUnscoped.mockResolvedValue(user());
+  mocks.getSubscriptionOrThrowUnscoped.mockResolvedValue(subscription(SubscriptionStatus.active));
+  mocks.getLegalStatus.mockResolvedValue({ mustAccept: false });
+  mocks.hasLeftMembershipUnscoped.mockResolvedValue(false);
+});
+
+describe("RouteGuardService.resolveAccountState", () => {
+  it("trusts the database over a stale session cache when deciding email verification", async () => {
+    mocks.getSession.mockResolvedValue(session({ createdAt: PAST, emailVerified: false }));
+    mocks.findAuthUserAccountStateUnscoped.mockResolvedValue({ companyId: null, emailVerified: true });
+    mocks.findCurrentUserUnscoped.mockResolvedValue(null);
+
+    const result = await makeService().resolveAccountState();
+
+    expect(result.state).toBe("unregistered");
+    expect(result.emailVerified).toBe(true);
+    expect(result.sessionUser?.emailVerified).toBe(true);
+  });
+
+  it("does not let a stale verified cookie bypass an unverified row past the grace", async () => {
+    mocks.getSession.mockResolvedValue(session({ createdAt: PAST, emailVerified: true }));
+    mocks.findAuthUserAccountStateUnscoped.mockResolvedValue({ companyId: null, emailVerified: false });
+    mocks.findCurrentUserUnscoped.mockResolvedValue(null);
+
+    const result = await makeService().resolveAccountState();
+
+    expect(result.state).toBe("overdueVerification");
+    expect(result.emailVerified).toBe(false);
+  });
+
+  it("resolves an absent session without loading product or tenant data", async () => {
+    mocks.getSession.mockResolvedValue(null);
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "unauthenticated",
+      user: null,
+    });
+    expect(mocks.findCurrentUserUnscoped).not.toHaveBeenCalled();
+    expect(mocks.getLegalStatus).not.toHaveBeenCalled();
+    expect(mocks.getSubscriptionOrThrowUnscoped).not.toHaveBeenCalled();
+  });
+
+  it("gives overdue verification precedence over every registered account blocker", async () => {
+    mocks.getSession.mockResolvedValue(session({ createdAt: PAST, emailVerified: false }));
+    mocks.findCurrentUserUnscoped.mockResolvedValue(user({ status: Status.inactive }));
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "overdueVerification",
+      emailVerified: false,
+    });
+    expect(mocks.getLegalStatus).not.toHaveBeenCalled();
+    expect(mocks.getSubscriptionOrThrowUnscoped).not.toHaveBeenCalled();
+  });
+
+  it("allows an unverified session inside the verification grace period", async () => {
+    mocks.getSession.mockResolvedValue(session({ emailVerified: false }));
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "allowed",
+      emailVerified: false,
+    });
+    expect(mocks.getSession).toHaveBeenCalledOnce();
+    expect(mocks.findCurrentUserUnscoped).toHaveBeenCalledWith("max@example.com");
+  });
+
+  it("resolves a session without a product user before tenant checks", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(null);
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "unregistered",
+      user: null,
+    });
+    expect(mocks.getLegalStatus).not.toHaveBeenCalled();
+    expect(mocks.getSubscriptionOrThrowUnscoped).not.toHaveBeenCalled();
+  });
+
+  it("uses only a live identity workspace binding for pre-tenant routing", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(null);
+    mocks.findAuthUserCompanyIdUnscoped.mockResolvedValue("invited-company-id");
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "unregistered",
+      sessionUser: { companyId: "invited-company-id" },
+    });
+  });
+
+  it("does not route a login back into a workspace it left", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(null);
+    mocks.findAuthUserCompanyIdUnscoped.mockResolvedValue("left-company-id");
+    mocks.hasLeftMembershipUnscoped.mockResolvedValue(true);
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "unregistered",
+      sessionUser: { companyId: null },
+    });
+    expect(mocks.hasLeftMembershipUnscoped).toHaveBeenCalledExactlyOnceWith("max@example.com", "left-company-id");
+  });
+
+  it("treats a cached session for a deleted identity as unauthenticated", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(null);
+    mocks.findAuthUserCompanyIdUnscoped.mockResolvedValue(undefined);
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "unauthenticated",
+      sessionUser: null,
+      user: null,
+    });
+    expect(mocks.getLegalStatus).not.toHaveBeenCalled();
+    expect(mocks.getSubscriptionOrThrowUnscoped).not.toHaveBeenCalled();
+    expect(mocks.existsUnscoped).not.toHaveBeenCalled();
+  });
+
+  it("discards an identity binding to a deleted workspace", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(null);
+    mocks.findAuthUserCompanyIdUnscoped.mockResolvedValue("deleted-company");
+    mocks.existsUnscoped.mockResolvedValue(false);
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "unregistered",
+      sessionUser: { companyId: null },
+    });
+    expect(mocks.existsUnscoped).toHaveBeenCalledExactlyOnceWith("deleted-company");
+  });
+
+  it("uses the tenant user's company without looking up the old identity binding", async () => {
+    mocks.findAuthUserCompanyIdUnscoped.mockResolvedValue("old-company");
+
+    expect(await makeService().resolveAccountState()).toMatchObject({ sessionUser: { companyId: "company-1" } });
+    expect(mocks.existsUnscoped).not.toHaveBeenCalled();
+  });
+
+  it("does not look up a company for an unbound identity", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(null);
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "unregistered",
+      sessionUser: { companyId: null },
+    });
+    expect(mocks.existsUnscoped).not.toHaveBeenCalled();
+  });
+
+  it("rejects a deleted identity even when the same email now has a tenant user", async () => {
+    mocks.findAuthUserCompanyIdUnscoped.mockResolvedValue(undefined);
+    mocks.findCurrentUserUnscoped.mockResolvedValue(user());
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "unauthenticated",
+      sessionUser: null,
+      user: null,
+    });
+    expect(mocks.findCurrentUserUnscoped).not.toHaveBeenCalled();
+    expect(mocks.getLegalStatus).not.toHaveBeenCalled();
+    expect(mocks.getSubscriptionOrThrowUnscoped).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [Status.inactive, "inactive"],
+    [Status.pendingAuthorization, "pending"],
+  ] as const)("resolves %s before legal and subscription checks", async (status, state) => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(user({ status }));
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state,
+    });
+    expect(mocks.getLegalStatus).not.toHaveBeenCalled();
+    expect(mocks.getSubscriptionOrThrowUnscoped).not.toHaveBeenCalled();
+  });
+
+  it("resolves incomplete administrator onboarding while the workspace plan is usable", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(user({ onboardingWizardCompletedAt: null }));
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "onboarding",
+    });
+  });
+
+  it("sends an incomplete administrator of a workspace without a usable plan to the plan page first", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(user({ onboardingWizardCompletedAt: null }));
+    mocks.getSubscriptionOrThrowUnscoped.mockResolvedValue(subscription(SubscriptionStatus.trial, PAST));
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "subscription",
+    });
+  });
+
+  it("fails closed if a new account status is not mapped explicitly", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(user({ status: "suspended" as Status }));
+
+    await expect(makeService().resolveAccountState()).rejects.toThrow("Unsupported account status: suspended");
+    expect(mocks.getLegalStatus).not.toHaveBeenCalled();
+    expect(mocks.getSubscriptionOrThrowUnscoped).not.toHaveBeenCalled();
+  });
+
+  it("resolves overdue legal acceptance before subscription expiry", async () => {
+    mocks.getLegalStatus.mockResolvedValue({ mustAccept: true });
+    mocks.getSubscriptionOrThrowUnscoped.mockResolvedValue(subscription(SubscriptionStatus.unPaid));
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "legal",
+      legalStatus: { mustAccept: true },
+    });
+    expect(mocks.getSubscriptionOrThrowUnscoped).not.toHaveBeenCalled();
+  });
+
+  it("resolves an expired subscription with the raw subscription", async () => {
+    mocks.getSubscriptionOrThrowUnscoped.mockResolvedValue(subscription(SubscriptionStatus.trial, PAST));
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "subscription",
+      subscription: { status: SubscriptionStatus.trial, trialEndDate: PAST },
+    });
+  });
+
+  it("returns allowed only after every account check passes", async () => {
+    const allowedUser = user();
+    mocks.findCurrentUserUnscoped.mockResolvedValue(allowedUser);
+
+    expect(await makeService().resolveAccountState()).toMatchObject({
+      state: "allowed",
+      user: allowedUser,
+    });
+    expect(mocks.getLegalStatus).toHaveBeenCalledOnce();
+    expect(mocks.getSubscriptionOrThrowUnscoped).toHaveBeenCalledOnce();
+  });
+});
+
+describe("accessRedirectForAccountState", () => {
+  it("redirects to sign-in when there is no valid session", async () => {
+    mocks.getSession.mockResolvedValue(null);
+
+    expect(await resolveAccess()).toEqual({
+      redirect: "/auth/signin",
+    });
+  });
+
+  it.each([
+    [null, null, "/onboarding"],
+    [user({ status: Status.inactive }), null, "/auth/error?type=inactiveUser"],
+    [user({ status: Status.pendingAuthorization }), null, "/auth/pending"],
+    [user({ onboardingWizardCompletedAt: null }), null, "/onboarding/wizard"],
+    [user(), { mustAccept: true }, "/legal-update"],
+  ] as const)("routes a blocked account to %s", async (resolvedUser, legal, redirect) => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(resolvedUser);
+    if (legal) mocks.getLegalStatus.mockResolvedValue(legal);
+
+    expect(await resolveAccess()).toEqual({ redirect });
+  });
+
+  it("routes an unpaid subscription to the recovery page", async () => {
+    mocks.getSubscriptionOrThrowUnscoped.mockResolvedValue(subscription(SubscriptionStatus.unPaid));
+
+    expect(await resolveAccess()).toEqual({
+      redirect: "/subscription-expired",
+    });
+  });
+
+  it("skips cloud-only account checks in demo mode", async () => {
+    mockEnv.APP_MODE = "demo";
+    mocks.getSubscriptionOrThrowUnscoped.mockResolvedValue(subscription(SubscriptionStatus.trial, PAST));
+
+    expect(await resolveAccess()).toBeNull();
+    expect(mocks.getLegalStatus).not.toHaveBeenCalled();
+    expect(mocks.getSubscriptionOrThrowUnscoped).not.toHaveBeenCalled();
+  });
+
+  it("lets an active user on a not-yet-expired trial through", async () => {
+    mocks.getSubscriptionOrThrowUnscoped.mockResolvedValue(subscription(SubscriptionStatus.trial, FUTURE));
+
+    expect(await resolveAccess()).toBeNull();
+  });
+
+  it("denies a member without the required resource permission", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(user({ role: { isSystemRole: false, permissions: [] } }));
+
+    expect(await resolveAccess({ resource: Resource.routines })).toEqual({
+      redirect: "/",
+    });
+  });
+
+  it("allows a member holding the required resource permission", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(
+      user({
+        role: {
+          isSystemRole: false,
+          permissions: [{ resource: Resource.routines, action: Action.readOwn }],
+        },
+      }),
+    );
+
+    expect(await resolveAccess({ resource: Resource.routines })).toBeNull();
+  });
+
+  it("lets a system-role user bypass the resource permission check", async () => {
+    expect(await resolveAccess({ resource: Resource.routines })).toBeNull();
+  });
+});
+
+describe("unauthenticatedRedirectForAccountState", () => {
+  it("keeps truly unauthenticated and pre-tenant sessions on public routes", async () => {
+    mocks.getSession.mockResolvedValue(null);
+    expect(await resolveUnauthenticated()).toBeNull();
+
+    mocks.getSession.mockResolvedValue(session());
+    mocks.findCurrentUserUnscoped.mockResolvedValue(null);
+    expect(await resolveUnauthenticated()).toBeNull();
+  });
+
+  it("uses the same blocker precedence as protected access", async () => {
+    mocks.getSession.mockResolvedValue(session({ createdAt: PAST, emailVerified: false }));
+    mocks.findCurrentUserUnscoped.mockResolvedValue(user({ status: Status.inactive }));
+
+    expect(await resolveUnauthenticated()).toEqual({
+      redirect: "/auth/verify-email",
+    });
+  });
+
+  it("returns an allowed account to the app", async () => {
+    expect(await resolveUnauthenticated()).toEqual({
+      redirect: "/",
+    });
+  });
+});
+
+describe("RouteGuardService.resolveMcpConsentState", () => {
+  async function consentState() {
+    const service = makeService();
+    return service.resolveMcpConsentState(await service.resolveAccountState());
+  }
+
+  it("keeps an incomplete administrator with a current workspace in onboarding", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(user({ onboardingWizardCompletedAt: null }));
+
+    expect(await consentState()).toBe("onboarding");
+  });
+
+  it("keeps a pending legal update blocking consent during onboarding", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(user({ onboardingWizardCompletedAt: null }));
+    mocks.getLegalStatus.mockResolvedValue({ mustAccept: true });
+
+    expect(await consentState()).toBe("legal");
+  });
+
+  it("keeps an expired subscription blocking consent during onboarding", async () => {
+    mocks.findCurrentUserUnscoped.mockResolvedValue(user({ onboardingWizardCompletedAt: null }));
+    mocks.getSubscriptionOrThrowUnscoped.mockResolvedValue(subscription(SubscriptionStatus.trial, PAST));
+
+    expect(await consentState()).toBe("subscription");
+  });
+
+  it("passes every other state through without further checks", async () => {
+    const service = makeService();
+    for (const state of ["allowed", "pending", "legal", "subscription", "unregistered"] as const)
+      expect(await service.resolveMcpConsentState({ state, user: user() } as never)).toBe(state);
+
+    expect(mocks.getLegalStatus).not.toHaveBeenCalled();
+    expect(mocks.getSubscriptionOrThrowUnscoped).not.toHaveBeenCalled();
+  });
+});
