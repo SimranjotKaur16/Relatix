@@ -1,0 +1,58 @@
+import type { FindUserRepo } from "../user/find-user.repo";
+import type { AuthService } from "./auth.service";
+import type { Data, Validated } from "@/core/validation/validation.utils";
+import type { Redirect } from "./auth-outcome";
+
+import { z } from "zod";
+
+import { SystemInteractor } from "@/core/decorators/system-interactor.decorator";
+import { runAfterResponse } from "@/core/utils/after-response";
+import { Validate } from "@/core/decorators/validate.decorator";
+import { redirectTo } from "./auth-outcome";
+import { callbackUrlSchema } from "./callback-url.schema";
+
+import { mustVerifyEmail } from "./email-verification-grace";
+import { onboardingIntentFromPath, pathWithOnboardingIntent } from "@/features/company/onboarding-intent-url";
+
+const Schema = z.object({
+  provider: z.enum(["google", "microsoft"]),
+  callbackURL: callbackUrlSchema.optional(),
+  errorCallbackURL: callbackUrlSchema.optional(),
+});
+type ContinueWithSocialsData = Data<typeof Schema>;
+
+@SystemInteractor
+export class ContinueWithSocialsInteractor {
+  constructor(
+    private readonly authService: AuthService,
+    private readonly findUserRepo: FindUserRepo,
+  ) {}
+
+  @Validate(Schema)
+  async invoke(data: ContinueWithSocialsData): Promise<Awaited<Validated<null>> | Redirect> {
+    const res = await this.authService.continueWithSocials(data);
+
+    if ("user" in res && res.user) {
+      const userExists = (await this.findUserRepo.listMembershipsUnscoped(res.user.email)).length > 0;
+
+      if (!userExists) {
+        const { email, name } = res.user;
+        runAfterResponse(() => this.authService.sendNewUserNotificationEmail({ email, name, provider: data.provider }));
+      }
+
+      if (mustVerifyEmail(res.user)) {
+        const onboardingIntent = onboardingIntentFromPath(data.callbackURL);
+        if (onboardingIntent.status === "invalid") return redirectTo("/auth/error?type=invalidOnboardingIntent");
+        return redirectTo(
+          onboardingIntent.status === "valid"
+            ? pathWithOnboardingIntent("/auth/verify-email", onboardingIntent.intent)
+            : "/auth/verify-email",
+        );
+      }
+    }
+
+    if (res.redirect) return redirectTo(res.url ?? data.callbackURL ?? "/");
+
+    return { ok: true as const, data: null };
+  }
+}
