@@ -1,0 +1,111 @@
+import type { AuthService } from "../auth.service";
+import type * as ValidationUtils from "@/core/validation/validation.utils";
+
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("next-intl/server", () => ({
+  getLocale: vi.fn().mockResolvedValue("en"),
+  getTranslations: vi.fn().mockResolvedValue(
+    Object.assign((key: string) => key, {
+      raw: (key: string) => key,
+    }),
+  ),
+}));
+
+vi.mock("@/core/validation/validation.utils", async (importOriginal) => {
+  const actual = await importOriginal<typeof ValidationUtils>();
+  return { ...actual, PASSWORD_MIN_LENGTH: 12 };
+});
+
+import { SignInWithEmailInteractor } from "../sign-in-with-email.interactor";
+import { CustomErrorCode } from "@/core/validation/validation.types";
+
+describe("SignInWithEmailInteractor", () => {
+  it("passes the callback through authentication and returns it as the safe destination", async () => {
+    const signInWithEmail = vi.fn().mockResolvedValue({ ok: true, user: { id: "synthetic-user" } });
+    const interactor = new SignInWithEmailInteractor({ signInWithEmail } as unknown as AuthService);
+
+    const result = await interactor.invoke({
+      email: "synthetic@example.com",
+      password: "local-demo-password",
+      rememberMe: true,
+      callbackURL: "/en/onboarding/wizard",
+    });
+
+    expect(signInWithEmail).toHaveBeenCalledWith({
+      email: "synthetic@example.com",
+      password: "local-demo-password",
+      rememberMe: true,
+      callbackURL: "/en/onboarding/wizard",
+    });
+    expect(result).toEqual({ redirect: "/en/onboarding/wizard" });
+  });
+
+  it("rejects an external callback before authentication can turn it into a browser destination", async () => {
+    const signInWithEmail = vi.fn();
+    const interactor = new SignInWithEmailInteractor({ signInWithEmail } as unknown as AuthService);
+
+    const result = await interactor.invoke({
+      email: "synthetic@example.com",
+      password: "local-demo-password",
+      rememberMe: true,
+      callbackURL: "https://malicious.example/collect-session",
+    });
+
+    expect(result).toMatchObject({ ok: false });
+    if ("ok" in result && !result.ok) expect(result.error.issues[0].message).toBe("Common.errors.invalidCallbackUrl");
+    expect(signInWithEmail).not.toHaveBeenCalled();
+  });
+
+  it("preserves onboarding intent when an unverified account must verify first", async () => {
+    const signInWithEmail = vi.fn().mockResolvedValue({ ok: false, error: "emailNotVerified" });
+    const interactor = new SignInWithEmailInteractor({ signInWithEmail } as unknown as AuthService);
+
+    const result = await interactor.invoke({
+      callbackURL: "/auth/invitation?intent=signed.intent",
+      email: "synthetic@example.com",
+      password: "local-demo-password",
+      rememberMe: true,
+    });
+
+    expect(result).toEqual({ redirect: "/auth/verify-email?intent=signed.intent" });
+  });
+
+  it("fails closed when an unverified sign-in callback contains duplicate intents", async () => {
+    const signInWithEmail = vi.fn().mockResolvedValue({ ok: false, error: "emailNotVerified" });
+    const interactor = new SignInWithEmailInteractor({ signInWithEmail } as unknown as AuthService);
+
+    await expect(
+      interactor.invoke({
+        callbackURL: "/auth/invitation?intent=one&intent=two",
+        email: "synthetic@example.com",
+        password: "local-demo-password",
+        rememberMe: true,
+      }),
+    ).resolves.toEqual({ redirect: "/auth/error?type=invalidOnboardingIntent" });
+  });
+
+  it("rejects a password below the shared minimum length before authentication", async () => {
+    const signInWithEmail = vi.fn();
+    const interactor = new SignInWithEmailInteractor({ signInWithEmail } as unknown as AuthService);
+
+    const result = await interactor.invoke({
+      email: "synthetic@example.com",
+      password: "p".repeat(11),
+      rememberMe: true,
+    });
+
+    expect(result).toMatchObject({ ok: false });
+    if ("ok" in result && !result.ok) {
+      expect(result.error.issues).toEqual([
+        expect.objectContaining({
+          code: "custom",
+          path: ["password"],
+          params: { error: CustomErrorCode.invalidCredentials },
+          message: "Common.errors.invalidCredentials",
+        }),
+      ]);
+    }
+    expect(signInWithEmail).not.toHaveBeenCalled();
+  });
+});
