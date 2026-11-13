@@ -1,0 +1,1443 @@
+import { PermissionService } from "@/core/base/permission.service";
+import { randomUUID } from "node:crypto";
+
+import { afterAll, describe, expect, it, vi } from "vitest";
+
+import type * as NextServer from "next/server";
+import type { LegalNoticeAuditPayload } from "@/features/legal/legal-audit.schema";
+import type { TenantUser } from "@/features/user/user.schema";
+import { getLocalDatabaseTestUrl } from "@/tests/helpers/database-test";
+
+import { createTranslator } from "next-intl";
+
+import messages from "@/i18n/locales/en.json";
+import { PrismaBillingUsageRepo } from "@/features/billing-usage/prisma-billing-usage.repository";
+
+const activeTenantUser = vi.hoisted(() => ({
+  value: null as TenantUser | null,
+}));
+const afterResponseTasks = vi.hoisted(() => [] as (() => Promise<unknown>)[]);
+
+vi.mock("next-intl/server", () => ({
+  getLocale: () => Promise.resolve("en"),
+  getTranslations: () => Promise.resolve(createTranslator({ locale: "en", messages })),
+}));
+vi.mock("@/env", () => ({
+  env: {
+    APP_MODE: "cloud",
+    DATABASE_URL: process.env.DATABASE_URL,
+    BASE_URL: "http://localhost:4000",
+    NODE_ENV: "test",
+  },
+}));
+vi.mock("next/server", async (importOriginal) => ({
+  ...(await importOriginal<typeof NextServer>()),
+  after: (task: () => Promise<unknown>) => {
+    afterResponseTasks.push(task);
+  },
+}));
+vi.mock("@/core/di", () => ({
+  getUserService: () => ({
+    getActiveUserOrThrow: () => {
+      if (!activeTenantUser.value) throw new Error("No active tenant user configured for the test");
+      return Promise.resolve(activeTenantUser.value);
+    },
+  }),
+}));
+
+const { PrismaUserRepo } = await import("@/features/user/prisma-user.repository");
+const { PrismaCompanyRepo } = await import("@/features/company/prisma-company.repository");
+const { RegisterUserInteractor } = await import("@/features/user/register/register-user.interactor");
+const { EventService } = await import("@/features/event/event.service");
+const { DomainEventListener } = await import("@/features/event/domain-event.listener");
+const { DomainEvent } = await import("@/features/event/domain-events");
+const { PrismaEventLogRepo } = await import("@/features/event/prisma-event-log.repository");
+const { GetLegalStatusInteractor } = await import("@/features/legal/get-legal-status.interactor");
+const { AcceptLegalDocumentsInteractor } = await import("@/features/legal/accept-legal-documents.interactor");
+const { currentLegalDocumentVersions } = await import("@/constants/legal-documents");
+const { prisma } = await import("@/prisma/db");
+const { runWithTenant, runWithoutTenant } = await import("@/core/decorators/tenant-context");
+const { runInTransaction } = await import("@/core/decorators/transaction-runner");
+const { runWithOperator } = await import("@/core/decorators/operator-context");
+const { createTestRecordRepo } = await import("@/tests/helpers/record-repository");
+const { createTestWorkspaceRegistration } = await import("@/tests/helpers/workspace-registration");
+const { createTestOperatorRepo } = await import("@/tests/helpers/prisma-operator-repo");
+
+const email = `real-db-check-${Date.now()}@example.com`;
+const companyIds: string[] = [];
+const authUserIds: string[] = [];
+const operatorActorIds: string[] = [];
+
+async function hasBlockedDatabaseSession(blockerPid: number): Promise<boolean> {
+  const [row] = await prisma.$queryRaw<Array<{ blocked: boolean }>>`
+    SELECT EXISTS (
+      SELECT 1
+      FROM pg_stat_activity activity
+      WHERE ${blockerPid} = ANY(pg_blocking_pids(activity.pid))
+    ) AS blocked
+  `;
+
+  return Boolean(row?.blocked);
+}
+
+async function waitForBlockedDatabaseSession(blockerPid: number): Promise<boolean> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (await hasBlockedDatabaseSession(blockerPid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  return false;
+}
+
+function unregisteredRouteGuardService(id: string, sessionEmail: string) {
+  return {
+    resolveAccountState: vi.fn().mockResolvedValue({
+      state: "unregistered",
+      sessionUser: {
+        createdAt: new Date(0),
+        email: sessionEmail,
+        emailVerified: true,
+        id,
+      },
+      user: null,
+      emailVerified: true,
+      legalStatus: null,
+      subscription: null,
+    }),
+  };
+}
+
+function newEventService() {
+  return new EventService([], new PrismaEventLogRepo({ dispatch: vi.fn().mockResolvedValue(undefined) }));
+}
+
+afterAll(async () => {
+  await runWithoutTenant(() =>
+    prisma.operatorAuditEvent.deleteMany({
+      where: { actorUserId: { in: operatorActorIds } },
+    }),
+  );
+  for (const authUserId of authUserIds)
+    await runWithoutTenant(() => prisma.authUser.deleteMany({ where: { id: authUserId } }));
+
+  for (const companyId of companyIds)
+    await runWithoutTenant(() => prisma.company.deleteMany({ where: { id: companyId } }));
+
+  await prisma.$disconnect();
+});
+
+const databaseUrl = getLocalDatabaseTestUrl();
+const describeDatabase = databaseUrl ? describe : describe.skip;
+
+describeDatabase("registration against a real database", () => {
+  it("creates the company and its owner without a record model", async () => {
+    const user = await runWithoutTenant(() =>
+      createTestWorkspaceRegistration().createCompanyAndUser({
+        email,
+        firstName: "Real",
+        lastName: "Check",
+        agreeToTerms: true,
+        avatarUrl: null,
+      }),
+    );
+
+    companyIds.push(user.companyId);
+    const companyId = user.companyId;
+
+    expect(await runWithoutTenant(() => prisma.crmRecord.count({ where: { companyId } }))).toBe(0);
+    expect(await runWithoutTenant(() => prisma.recordSchemaState.findUnique({ where: { companyId } }))).toBeNull();
+
+    const persistedUser = await runWithoutTenant(() =>
+      prisma.user.findUniqueOrThrow({
+        where: { id: user.id },
+        select: { agreeToTerms: true },
+      }),
+    );
+
+    expect(persistedUser).toEqual({ agreeToTerms: true });
+    expect(await runWithoutTenant(() => prisma.user.findUniqueOrThrow({ where: { id: user.id } }))).not.toHaveProperty(
+      "country",
+    );
+  });
+
+  it("stores one attribution row per provider transactionally and deletes them at each provider's expiry", async () => {
+    const repo = new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo());
+    const clickedAt = new Date("2026-08-31T09:55:00.000Z");
+    const capturedAt = new Date("2026-08-31T10:00:00.000Z");
+    const googleExpiresAt = new Date("2026-11-28T10:00:00.000Z");
+    const openAiExpiresAt = new Date("2026-09-30T10:00:00.000Z");
+    const owner = await runWithoutTenant(() =>
+      createTestWorkspaceRegistration().createCompanyAndUser({
+        email: `ad-click-${Date.now()}@example.com`,
+        firstName: "Ad",
+        lastName: "Click",
+        agreeToTerms: true,
+        avatarUrl: null,
+        adAttribution: [
+          {
+            provider: "google_ads",
+            identifierKind: "gclid",
+            identifierValue: "Case-Sensitive_GCLID",
+            clickedAt,
+            capturedAt,
+            consentedAt: capturedAt,
+            consentNoticeVersion: "2026-09-02",
+            expiresAt: googleExpiresAt,
+          },
+          {
+            provider: "openai_ads",
+            identifierKind: "oppref",
+            identifierValue: "Opaque-OPPREF",
+            clickedAt,
+            capturedAt,
+            consentedAt: capturedAt,
+            consentNoticeVersion: "2026-09-02",
+            expiresAt: openAiExpiresAt,
+          },
+        ],
+      }),
+    );
+    companyIds.push(owner.companyId);
+
+    await expect(
+      runWithoutTenant(() =>
+        prisma.adAttribution.findMany({
+          where: { companyId: owner.companyId },
+          orderBy: { provider: "asc" },
+          select: {
+            provider: true,
+            identifierKind: true,
+            identifierValue: true,
+            clickedAt: true,
+            userId: true,
+          },
+        }),
+      ),
+    ).resolves.toEqual([
+      {
+        provider: "google_ads",
+        identifierKind: "gclid",
+        identifierValue: "Case-Sensitive_GCLID",
+        clickedAt,
+        userId: owner.id,
+      },
+      {
+        provider: "openai_ads",
+        identifierKind: "oppref",
+        identifierValue: "Opaque-OPPREF",
+        clickedAt,
+        userId: owner.id,
+      },
+    ]);
+
+    await expect(
+      runWithoutTenant(() =>
+        prisma.conversionEvent.findMany({
+          where: { companyId: owner.companyId },
+          select: { type: true },
+        }),
+      ),
+    ).resolves.toEqual([{ type: "signup" }]);
+
+    await expect(repo.expireAdAttributionUnscoped(new Date("2026-09-30T09:59:59.000Z"))).resolves.toBe(0);
+    await expect(repo.expireAdAttributionUnscoped(openAiExpiresAt)).resolves.toBe(1);
+    await expect(
+      runWithoutTenant(() =>
+        prisma.adAttribution.findMany({
+          where: { companyId: owner.companyId },
+          select: { provider: true },
+        }),
+      ),
+    ).resolves.toEqual([{ provider: "google_ads" }]);
+
+    await expect(runWithTenant(owner, () => repo.clearAdAttributionForUser({ userId: owner.id }))).resolves.toBe(true);
+    await expect(
+      runWithoutTenant(() => prisma.adAttribution.count({ where: { companyId: owner.companyId } })),
+    ).resolves.toBe(0);
+    await expect(runWithTenant(owner, () => repo.clearAdAttributionForUser({ userId: owner.id }))).resolves.toBe(false);
+
+    await expect(
+      runWithoutTenant(() =>
+        prisma.user.findUniqueOrThrow({
+          where: { id: owner.id },
+          select: { onboardingWizardCompletedAt: true },
+        }),
+      ),
+    ).resolves.toEqual({ onboardingWizardCompletedAt: null });
+  });
+
+  it("atomically creates a new cloud company and its initial legal audit evidence", async () => {
+    const registrationEmail = `legal-registration-${Date.now()}@example.com`;
+    const authUserId = `auth-${Date.now()}`;
+    const authService = {
+      sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+    };
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: {
+          id: authUserId,
+          name: "Legal Evidence",
+          email: registrationEmail,
+          companyId: null,
+        },
+      }),
+    );
+    authUserIds.push(authUserId);
+    const eventService = new EventService(
+      [],
+      new PrismaEventLogRepo({
+        dispatch: vi.fn().mockResolvedValue(undefined),
+      }),
+    );
+    const interactor = new RegisterUserInteractor(
+      authService as never,
+      new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo()),
+      eventService,
+      unregisteredRouteGuardService(authUserId, registrationEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    );
+
+    const result = await interactor.invoke(
+      {
+        email: registrationEmail,
+        firstName: "Legal",
+        lastName: "Evidence",
+        agreeToTerms: true,
+        avatarUrl: null,
+      },
+      { target: { type: "createCompany" } },
+    );
+    expect(result).toEqual({
+      ok: true,
+      data: { redirectTo: "/onboarding/wizard" },
+    });
+
+    const user = await runWithoutTenant(() => prisma.user.findFirstOrThrow({ where: { email: registrationEmail } }));
+    companyIds.push(user.companyId);
+    const tenantUser = await new PrismaUserRepo(
+      new PermissionService(),
+      new PrismaBillingUsageRepo(),
+    ).findAnyMembershipUnscoped(registrationEmail);
+    if (!tenantUser) throw new Error("The newly registered workspace owner is missing.");
+    await runWithTenant(tenantUser, async () => {
+      const records = createTestRecordRepo();
+      expect(await records.getState()).toBeNull();
+      expect(await records.getModel()).toMatchObject({
+        revision: 0,
+        types: [],
+        fields: [],
+        relationships: [],
+        capabilities: [],
+      });
+    });
+    expect(
+      await runWithoutTenant(() => prisma.recordSchemaRevision.count({ where: { companyId: user.companyId } })),
+    ).toBe(0);
+    expect(
+      await runWithoutTenant(() =>
+        prisma.authUser.findUniqueOrThrow({
+          where: { id: authUserId },
+          select: { companyId: true },
+        }),
+      ),
+    ).toEqual({ companyId: user.companyId });
+    const acceptance = await runWithoutTenant(() =>
+      prisma.eventLog.findFirstOrThrow({
+        where: {
+          companyId: user.companyId,
+          subjectId: user.companyId,
+          kind: DomainEvent.LEGAL_DOCUMENTS_ACCEPTED,
+          actorId: user.id,
+        },
+      }),
+    );
+    expect(acceptance.payload).toMatchObject({
+      acceptanceType: "initial-onboarding",
+      acceptingEmail: registrationEmail,
+    });
+
+    const noticePayload: LegalNoticeAuditPayload = {
+      versions: currentLegalDocumentVersions(),
+      changedDocuments: ["terms", "dpa", "privacy", "subprocessors"],
+      recipientEmail: user.email,
+      effectiveAt: "2026-08-21T09:00:00.000Z",
+    };
+    await runWithoutTenant(() =>
+      runInTransaction(
+        async () => {
+          await eventService.publish(
+            DomainEvent.LEGAL_NOTICE_SENT,
+            { entityId: user.id, payload: noticePayload },
+            { systemCompanyId: user.companyId, systemUserId: user.id },
+          );
+        },
+        { companyId: user.companyId },
+      ),
+    );
+
+    const combinedEvents = await runWithoutTenant(() =>
+      prisma.eventLog.findMany({
+        where: {
+          companyId: user.companyId,
+          kind: DomainEvent.LEGAL_NOTICE_SENT,
+          actorId: user.id,
+        },
+      }),
+    );
+    expect(combinedEvents).toHaveLength(1);
+    expect(combinedEvents[0].subjectId).toBe(user.id);
+    expect(combinedEvents[0].payload).toEqual(noticePayload);
+
+    await expect(
+      runWithoutTenant(() =>
+        runInTransaction(
+          async () => {
+            await eventService.publish(
+              DomainEvent.LEGAL_NOTICE_SENT,
+              { entityId: user.id, payload: noticePayload },
+              { systemCompanyId: user.companyId, systemUserId: user.id },
+            );
+            throw new Error("forced notice rollback");
+          },
+          { companyId: user.companyId },
+        ),
+      ),
+    ).rejects.toThrow("forced notice rollback");
+    expect(
+      await runWithoutTenant(() =>
+        prisma.eventLog.count({
+          where: {
+            companyId: user.companyId,
+            kind: DomainEvent.LEGAL_NOTICE_SENT,
+            actorId: user.id,
+          },
+        }),
+      ),
+    ).toBe(1);
+  });
+
+  it("commits the registration before the operator notification and never waits for it", async () => {
+    const registrationEmail = `notification-after-commit-${Date.now()}@example.com`;
+    const authUserId = `auth-notification-${Date.now()}`;
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: { id: authUserId, name: "Slow Mail", email: registrationEmail, companyId: null },
+      }),
+    );
+    authUserIds.push(authUserId);
+    let registeredWhenSending: boolean | null = null;
+    const sendNewUserNotificationEmail = vi.fn(async () => {
+      registeredWhenSending =
+        (await runWithoutTenant(() => prisma.user.count({ where: { email: registrationEmail } }))) === 1;
+      await new Promise((resolve) => setTimeout(resolve, 6000));
+    });
+    afterResponseTasks.length = 0;
+    const interactor = new RegisterUserInteractor(
+      { sendNewUserNotificationEmail } as never,
+      new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo()),
+      newEventService(),
+      unregisteredRouteGuardService(authUserId, registrationEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    );
+
+    const result = await interactor.invoke(
+      {
+        email: registrationEmail,
+        firstName: "Slow",
+        lastName: "Mail",
+        agreeToTerms: true,
+        avatarUrl: null,
+      },
+      { target: { type: "createCompany" } },
+    );
+
+    expect(result).toEqual({ ok: true, data: { redirectTo: "/onboarding/wizard" } });
+    const user = await runWithoutTenant(() => prisma.user.findFirstOrThrow({ where: { email: registrationEmail } }));
+    companyIds.push(user.companyId);
+    expect(sendNewUserNotificationEmail).not.toHaveBeenCalled();
+    expect(afterResponseTasks).toHaveLength(1);
+
+    void afterResponseTasks[0]();
+    await vi.waitFor(() => expect(registeredWhenSending).toBe(true));
+    expect(sendNewUserNotificationEmail).toHaveBeenCalledWith({ email: registrationEmail, name: "Slow Mail" });
+  }, 15_000);
+
+  it("persists an invited cloud user's acknowledgement without company-wide acceptance", async () => {
+    const suffix = Date.now();
+    const repo = new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo());
+    const administrator = await runWithoutTenant(() =>
+      createTestWorkspaceRegistration().createCompanyAndUser({
+        email: `invite-admin-${suffix}@example.com`,
+        firstName: "Invite",
+        lastName: "Admin",
+        agreeToTerms: true,
+        avatarUrl: null,
+      }),
+    );
+    companyIds.push(administrator.companyId);
+
+    const authUserId = `auth-invite-${suffix}`;
+    const invitedEmail = `invite-member-${suffix}@example.com`;
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: {
+          id: authUserId,
+          name: "Invited Member",
+          email: invitedEmail,
+          companyId: administrator.companyId,
+        },
+      }),
+    );
+    authUserIds.push(authUserId);
+
+    const eventService = new EventService(
+      [],
+      new PrismaEventLogRepo({
+        dispatch: vi.fn().mockResolvedValue(undefined),
+      }),
+    );
+    const interactor = new RegisterUserInteractor(
+      {
+        sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+      } as never,
+      repo,
+      eventService,
+      unregisteredRouteGuardService(authUserId, invitedEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    );
+
+    const result = await interactor.invoke(
+      {
+        email: "forged-invited-email@example.com",
+        firstName: "Invited",
+        lastName: "Member",
+        agreeToTerms: true,
+        avatarUrl: null,
+      },
+      { target: { type: "existingAuthUserCompanyBinding" } },
+    );
+    expect(result).toEqual({ ok: true, data: { redirectTo: "/auth/pending" } });
+
+    const invitedUser = await runWithoutTenant(() =>
+      prisma.user.findFirstOrThrow({
+        where: { email: invitedEmail },
+        select: { agreeToTerms: true, companyId: true, status: true },
+      }),
+    );
+    expect(invitedUser).toEqual({
+      agreeToTerms: true,
+      companyId: administrator.companyId,
+      status: "pendingAuthorization",
+    });
+    expect(
+      await runWithoutTenant(() =>
+        prisma.eventLog.count({
+          where: {
+            companyId: administrator.companyId,
+            kind: DomainEvent.LEGAL_DOCUMENTS_ACCEPTED,
+          },
+        }),
+      ),
+    ).toBe(0);
+  });
+
+  it("joins the invited workspace when the identity carries no company of its own", async () => {
+    const suffix = `${Date.now()}-cookie`;
+    const repo = new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo());
+    const inviter = await runWithoutTenant(() =>
+      createTestWorkspaceRegistration().createCompanyAndUser({
+        email: `cookie-admin-${suffix}@example.com`,
+        firstName: "Cookie",
+        lastName: "Admin",
+        agreeToTerms: true,
+        avatarUrl: null,
+      }),
+    );
+    companyIds.push(inviter.companyId);
+
+    const authUserId = `auth-cookie-${suffix}`;
+    const invitedEmail = `cookie-member-${suffix}@example.com`;
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: {
+          id: authUserId,
+          name: "Cookie Member",
+          email: invitedEmail,
+          companyId: null,
+        },
+      }),
+    );
+    authUserIds.push(authUserId);
+
+    const interactor = new RegisterUserInteractor(
+      {
+        sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+      } as never,
+      repo,
+      newEventService(),
+      unregisteredRouteGuardService(authUserId, invitedEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    );
+
+    const result = await interactor.invoke(
+      {
+        email: invitedEmail,
+        firstName: "Cookie",
+        lastName: "Member",
+        agreeToTerms: true,
+        avatarUrl: null,
+      },
+      { target: { type: "invitation", companyId: inviter.companyId } },
+    );
+    expect(result).toEqual({ ok: true, data: { redirectTo: "/auth/pending" } });
+
+    const joined = await runWithoutTenant(() =>
+      prisma.user.findFirstOrThrow({
+        where: { email: invitedEmail },
+        select: { companyId: true, status: true },
+      }),
+    );
+    expect(joined).toEqual({
+      companyId: inviter.companyId,
+      status: "pendingAuthorization",
+    });
+    expect(
+      await runWithoutTenant(() =>
+        prisma.authUser.findUniqueOrThrow({
+          where: { id: authUserId },
+          select: { companyId: true },
+        }),
+      ),
+    ).toEqual({ companyId: inviter.companyId });
+    expect(
+      await runWithoutTenant(() =>
+        prisma.company.count({
+          where: {
+            id: { not: inviter.companyId },
+            users: { some: { email: invitedEmail } },
+          },
+        }),
+      ),
+    ).toBe(0);
+  });
+
+  it("ignores an identity company that no longer exists and joins the invited workspace instead", async () => {
+    const suffix = `${Date.now()}-stale`;
+    const repo = new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo());
+    const inviter = await runWithoutTenant(() =>
+      createTestWorkspaceRegistration().createCompanyAndUser({
+        email: `stale-admin-${suffix}@example.com`,
+        firstName: "Stale",
+        lastName: "Admin",
+        agreeToTerms: true,
+        avatarUrl: null,
+      }),
+    );
+    companyIds.push(inviter.companyId);
+
+    const deletedCompany = await runWithoutTenant(() => prisma.company.create({ data: {} }));
+    const authUserId = `auth-stale-${suffix}`;
+    const invitedEmail = `stale-member-${suffix}@example.com`;
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: {
+          id: authUserId,
+          name: "Stale Member",
+          email: invitedEmail,
+          companyId: deletedCompany.id,
+        },
+      }),
+    );
+    authUserIds.push(authUserId);
+    await runWithoutTenant(() => prisma.company.delete({ where: { id: deletedCompany.id } }));
+
+    expect(await runWithoutTenant(() => repo.findAuthUserCompanyIdUnscoped(authUserId))).toBe(deletedCompany.id);
+    expect(
+      await runWithoutTenant(() =>
+        new PrismaCompanyRepo(new PrismaBillingUsageRepo()).existsUnscoped(deletedCompany.id),
+      ),
+    ).toBe(false);
+
+    const interactor = new RegisterUserInteractor(
+      {
+        sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+      } as never,
+      repo,
+      newEventService(),
+      unregisteredRouteGuardService(authUserId, invitedEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    );
+
+    const result = await interactor.invoke(
+      {
+        email: invitedEmail,
+        firstName: "Stale",
+        lastName: "Member",
+        agreeToTerms: true,
+        avatarUrl: null,
+      },
+      { target: { type: "invitation", companyId: inviter.companyId } },
+    );
+    expect(result).toEqual({ ok: true, data: { redirectTo: "/auth/pending" } });
+
+    const joined = await runWithoutTenant(() =>
+      prisma.user.findFirstOrThrow({
+        where: { email: invitedEmail },
+        select: { companyId: true },
+      }),
+    );
+    expect(joined.companyId).toBe(inviter.companyId);
+    expect(
+      await runWithoutTenant(() =>
+        prisma.authUser.findUniqueOrThrow({
+          where: { id: authUserId },
+          select: { companyId: true },
+        }),
+      ),
+    ).toEqual({ companyId: inviter.companyId });
+  });
+
+  it("fails cleanly when the invited workspace was deleted before registration", async () => {
+    const suffix = `${Date.now()}-deleted-invite`;
+    const deletedCompany = await runWithoutTenant(() => prisma.company.create({ data: {} }));
+    await runWithoutTenant(() => prisma.company.delete({ where: { id: deletedCompany.id } }));
+
+    const authUserId = `auth-${suffix}`;
+    const registrationEmail = `deleted-invite-${suffix}@example.com`;
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: {
+          id: authUserId,
+          name: "Deleted Invite",
+          email: registrationEmail,
+          companyId: null,
+        },
+      }),
+    );
+    authUserIds.push(authUserId);
+    const interactor = new RegisterUserInteractor(
+      {
+        sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+      } as never,
+      new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo()),
+      newEventService(),
+      unregisteredRouteGuardService(authUserId, registrationEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    );
+
+    await expect(
+      interactor.invoke(
+        {
+          email: registrationEmail,
+          firstName: "Deleted",
+          lastName: "Invite",
+          agreeToTerms: true,
+          avatarUrl: null,
+        },
+        { target: { type: "invitation", companyId: deletedCompany.id } },
+      ),
+    ).resolves.toEqual({ redirect: "/auth/error?type=invalidInviteLink" });
+    expect(await runWithoutTenant(() => prisma.user.findFirst({ where: { email: registrationEmail } }))).toBeNull();
+    expect(
+      await runWithoutTenant(() =>
+        prisma.authUser.findUniqueOrThrow({
+          where: { id: authUserId },
+          select: { companyId: true },
+        }),
+      ),
+    ).toEqual({ companyId: null });
+  });
+
+  it("creates nothing without an invitation or explicit create decision", async () => {
+    const suffix = `${Date.now()}-no-decision`;
+    const authUserId = `auth-${suffix}`;
+    const registrationEmail = `no-decision-${suffix}@example.com`;
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: {
+          id: authUserId,
+          name: "No Decision",
+          email: registrationEmail,
+          companyId: null,
+        },
+      }),
+    );
+    authUserIds.push(authUserId);
+
+    const interactor = new RegisterUserInteractor(
+      {
+        sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+      } as never,
+      new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo()),
+      newEventService(),
+      unregisteredRouteGuardService(authUserId, registrationEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    );
+
+    const result = await interactor.invoke(
+      {
+        email: registrationEmail,
+        firstName: "No",
+        lastName: "Decision",
+        agreeToTerms: true,
+        avatarUrl: null,
+      },
+      { target: { type: "existingAuthUserCompanyBinding" } },
+    );
+
+    expect(result).toEqual({ redirect: "/onboarding" });
+    expect(await runWithoutTenant(() => prisma.user.findFirst({ where: { email: registrationEmail } }))).toBeNull();
+  });
+
+  it("creates nothing when a cached session references a deleted AuthUser", async () => {
+    const suffix = `${Date.now()}-deleted-identity`;
+    const repo = new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo());
+    const inviter = await runWithoutTenant(() =>
+      createTestWorkspaceRegistration().createCompanyAndUser({
+        email: `deleted-identity-admin-${suffix}@example.com`,
+        firstName: "Deleted Identity",
+        lastName: "Admin",
+        agreeToTerms: true,
+        avatarUrl: null,
+      }),
+    );
+    companyIds.push(inviter.companyId);
+
+    const missingAuthUserId = `auth-${suffix}`;
+    const registrationEmail = `deleted-identity-member-${suffix}@example.com`;
+    const interactor = new RegisterUserInteractor(
+      {
+        sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+      } as never,
+      repo,
+      newEventService(),
+      unregisteredRouteGuardService(missingAuthUserId, registrationEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    );
+
+    const result = await interactor.invoke(
+      {
+        email: registrationEmail,
+        firstName: "Deleted",
+        lastName: "Identity",
+        agreeToTerms: true,
+        avatarUrl: null,
+      },
+      { target: { type: "invitation", companyId: inviter.companyId } },
+    );
+
+    expect(result).toEqual({ redirect: "/auth/signup" });
+    expect(await runWithoutTenant(() => prisma.user.findFirst({ where: { email: registrationEmail } }))).toBeNull();
+  });
+
+  it("prefers the current invitation over an older live identity binding", async () => {
+    const suffix = `${Date.now()}-invite-precedence`;
+    const repo = new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo());
+    const olderWorkspaceAdmin = await runWithoutTenant(() =>
+      createTestWorkspaceRegistration().createCompanyAndUser({
+        email: `older-admin-${suffix}@example.com`,
+        firstName: "Older",
+        lastName: "Admin",
+        agreeToTerms: true,
+        avatarUrl: null,
+      }),
+    );
+    const currentWorkspaceAdmin = await runWithoutTenant(() =>
+      createTestWorkspaceRegistration().createCompanyAndUser({
+        email: `current-admin-${suffix}@example.com`,
+        firstName: "Current",
+        lastName: "Admin",
+        agreeToTerms: true,
+        avatarUrl: null,
+      }),
+    );
+    companyIds.push(olderWorkspaceAdmin.companyId, currentWorkspaceAdmin.companyId);
+
+    const authUserId = `auth-${suffix}`;
+    const invitedEmail = `precedence-member-${suffix}@example.com`;
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: {
+          id: authUserId,
+          name: "Precedence Member",
+          email: invitedEmail,
+          companyId: olderWorkspaceAdmin.companyId,
+        },
+      }),
+    );
+    authUserIds.push(authUserId);
+
+    const interactor = new RegisterUserInteractor(
+      {
+        sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+      } as never,
+      repo,
+      newEventService(),
+      unregisteredRouteGuardService(authUserId, invitedEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    );
+
+    const result = await interactor.invoke(
+      {
+        email: invitedEmail,
+        firstName: "Precedence",
+        lastName: "Member",
+        agreeToTerms: true,
+        avatarUrl: null,
+      },
+      {
+        target: {
+          type: "invitation",
+          companyId: currentWorkspaceAdmin.companyId,
+        },
+      },
+    );
+
+    expect(result).toEqual({ ok: true, data: { redirectTo: "/auth/pending" } });
+    expect(
+      await runWithoutTenant(() =>
+        prisma.user.findFirstOrThrow({
+          where: { email: invitedEmail },
+          select: { companyId: true, status: true },
+        }),
+      ),
+    ).toEqual({
+      companyId: currentWorkspaceAdmin.companyId,
+      status: "pendingAuthorization",
+    });
+    expect(
+      await runWithoutTenant(() =>
+        prisma.authUser.findUniqueOrThrow({
+          where: { id: authUserId },
+          select: { companyId: true },
+        }),
+      ),
+    ).toEqual({ companyId: currentWorkspaceAdmin.companyId });
+  });
+
+  it("makes simultaneous company-creation registrations for one identity idempotent", async () => {
+    const suffix = randomUUID();
+    const authUserId = `auth-duplicate-${suffix}`;
+    const invitedEmail = `duplicate-owner-${suffix}@example.invalid`;
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: {
+          id: authUserId,
+          name: "Duplicate Member",
+          email: invitedEmail,
+          companyId: null,
+        },
+      }),
+    );
+    authUserIds.push(authUserId);
+
+    let reportLocked!: (pid: number) => void;
+    const authUserLocked = new Promise<number>((resolve) => {
+      reportLocked = resolve;
+    });
+    let releaseFirstRegistration!: () => void;
+    const firstRegistrationReleased = new Promise<void>((resolve) => {
+      releaseFirstRegistration = resolve;
+    });
+
+    const firstRegistrationUserRepo = new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo());
+    const findFirstAuthUserCompanyIdForUpdateUnscoped =
+      firstRegistrationUserRepo.findAuthUserCompanyIdForUpdateUnscoped.bind(firstRegistrationUserRepo);
+    vi.spyOn(firstRegistrationUserRepo, "findAuthUserCompanyIdForUpdateUnscoped").mockImplementation(
+      async (userId: string) => {
+        const companyId = await findFirstAuthUserCompanyIdForUpdateUnscoped(userId);
+        const [connection] = await firstRegistrationUserRepo.prisma.$queryRaw<
+          Array<{ pid: number }>
+        >`SELECT pg_backend_pid() AS pid`;
+        if (!connection) throw new Error("Registration transaction has no database connection");
+        reportLocked(connection.pid);
+        await firstRegistrationReleased;
+        return companyId;
+      },
+    );
+
+    const registrationData = {
+      email: invitedEmail,
+      firstName: "Duplicate",
+      lastName: "Member",
+      agreeToTerms: true,
+      avatarUrl: null,
+    };
+    const registrationTarget = { target: { type: "createCompany" as const } };
+    const authService = {
+      sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+    } as never;
+    const firstRegistration = new RegisterUserInteractor(
+      authService,
+      firstRegistrationUserRepo,
+      newEventService(),
+      unregisteredRouteGuardService(authUserId, invitedEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    ).invoke(registrationData, registrationTarget);
+
+    const blockerPid = await authUserLocked;
+    const secondRegistration = new RegisterUserInteractor(
+      authService,
+      new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo()),
+      newEventService(),
+      unregisteredRouteGuardService(authUserId, invitedEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    ).invoke(registrationData, registrationTarget);
+
+    const secondRegistrationBlocked = await waitForBlockedDatabaseSession(blockerPid);
+    releaseFirstRegistration();
+
+    const [firstResult, secondResult] = await Promise.all([firstRegistration, secondRegistration]);
+    expect(secondRegistrationBlocked).toBe(true);
+    expect(firstResult).toEqual({
+      ok: true,
+      data: { redirectTo: "/onboarding/wizard" },
+    });
+    expect(secondResult).toEqual({ redirect: "/onboarding/wizard" });
+
+    await runWithoutTenant(async () => {
+      expect(await prisma.user.count({ where: { email: invitedEmail } })).toBe(1);
+      expect(
+        await prisma.company.count({
+          where: { users: { some: { email: invitedEmail } } },
+        }),
+      ).toBe(1);
+      const user = await prisma.user.findFirstOrThrow({
+        where: { email: invitedEmail },
+        select: { companyId: true },
+      });
+      companyIds.push(user.companyId);
+      expect(
+        await prisma.authUser.findUniqueOrThrow({
+          where: { id: authUserId },
+          select: { companyId: true },
+        }),
+      ).toEqual({ companyId: user.companyId });
+    });
+  });
+
+  it("keeps the invited workspace binding when operator deletion races with registration", async () => {
+    const suffix = randomUUID();
+    const deletedWorkspaceAdmin = await runWithoutTenant(() =>
+      createTestWorkspaceRegistration().createCompanyAndUser({
+        email: `race-source-${suffix}@race-source.invalid`,
+        firstName: "Race",
+        lastName: "Source",
+        agreeToTerms: true,
+        avatarUrl: null,
+      }),
+    );
+    const invitedWorkspaceAdmin = await runWithoutTenant(() =>
+      createTestWorkspaceRegistration().createCompanyAndUser({
+        email: `race-target-${suffix}@race-target.invalid`,
+        firstName: "Race",
+        lastName: "Target",
+        agreeToTerms: true,
+        avatarUrl: null,
+      }),
+    );
+    companyIds.push(deletedWorkspaceAdmin.companyId, invitedWorkspaceAdmin.companyId);
+
+    const authUserId = `auth-race-${suffix}`;
+    const invitedEmail = `race-member-${suffix}@example.invalid`;
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: {
+          id: authUserId,
+          name: "Race Member",
+          email: invitedEmail,
+          companyId: deletedWorkspaceAdmin.companyId,
+        },
+      }),
+    );
+    authUserIds.push(authUserId);
+
+    let reportLocked!: (pid: number) => void;
+    const authUserLocked = new Promise<number>((resolve) => {
+      reportLocked = resolve;
+    });
+    let releaseRegistration!: () => void;
+    const registrationReleased = new Promise<void>((resolve) => {
+      releaseRegistration = resolve;
+    });
+
+    const lockPausingUserRepo = new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo());
+    const findLockedAuthUserCompanyIdForUpdateUnscoped =
+      lockPausingUserRepo.findAuthUserCompanyIdForUpdateUnscoped.bind(lockPausingUserRepo);
+    vi.spyOn(lockPausingUserRepo, "findAuthUserCompanyIdForUpdateUnscoped").mockImplementation(
+      async (userId: string) => {
+        const companyId = await findLockedAuthUserCompanyIdForUpdateUnscoped(userId);
+        const [connection] = await lockPausingUserRepo.prisma.$queryRaw<
+          Array<{ pid: number }>
+        >`SELECT pg_backend_pid() AS pid`;
+        if (!connection) throw new Error("Registration transaction has no database connection");
+        reportLocked(connection.pid);
+        await registrationReleased;
+        return companyId;
+      },
+    );
+
+    const registration = new RegisterUserInteractor(
+      {
+        sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+      } as never,
+      lockPausingUserRepo,
+      newEventService(),
+      unregisteredRouteGuardService(authUserId, invitedEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    ).invoke(
+      {
+        email: invitedEmail,
+        firstName: "Race",
+        lastName: "Member",
+        agreeToTerms: true,
+        avatarUrl: null,
+      },
+      {
+        target: {
+          type: "invitation",
+          companyId: invitedWorkspaceAdmin.companyId,
+        },
+      },
+    );
+
+    const blockerPid = await authUserLocked;
+    const actor = {
+      authUserId: `auth-operator-${suffix}`,
+      companyId: `operator-company-${suffix}`,
+      email: `operator-${suffix}@example.invalid`,
+      userId: `operator-${suffix}`,
+    };
+    operatorActorIds.push(actor.userId);
+    const deletion = runWithOperator(actor, () =>
+      createTestOperatorRepo().deleteWorkspaceUnscoped({
+        companyId: deletedWorkspaceAdmin.companyId,
+        confirmWorkspaceLabel: `race-source-${suffix}@race-source.invalid · ${deletedWorkspaceAdmin.companyId.slice(0, 8)}`,
+        reason: "Concurrency regression",
+      }),
+    );
+
+    const operatorDeletionBlocked = await waitForBlockedDatabaseSession(blockerPid);
+    releaseRegistration();
+
+    const [registrationResult, deletionResult] = await Promise.all([registration, deletion]);
+    expect(operatorDeletionBlocked).toBe(true);
+    expect(registrationResult).toEqual({
+      ok: true,
+      data: { redirectTo: "/auth/pending" },
+    });
+    expect(deletionResult).toMatchObject({
+      companyId: deletedWorkspaceAdmin.companyId,
+      deletedMemberCount: 1,
+    });
+
+    await runWithoutTenant(async () => {
+      expect(
+        await prisma.company.findUnique({
+          where: { id: deletedWorkspaceAdmin.companyId },
+        }),
+      ).toBeNull();
+      expect(
+        await prisma.authUser.findUniqueOrThrow({
+          where: { id: authUserId },
+          select: { companyId: true },
+        }),
+      ).toEqual({ companyId: invitedWorkspaceAdmin.companyId });
+      expect(
+        await prisma.user.findFirstOrThrow({
+          where: { email: invitedEmail },
+          select: { companyId: true, status: true },
+        }),
+      ).toEqual({
+        companyId: invitedWorkspaceAdmin.companyId,
+        status: "pendingAuthorization",
+      });
+    });
+  });
+
+  it("enforces and clears one company-wide deadline across an administrator and member", async () => {
+    const suffix = Date.now();
+    const repo = new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo());
+    const admin = await runWithoutTenant(() =>
+      createTestWorkspaceRegistration().createCompanyAndUser({
+        email: `legal-admin-${suffix}@example.com`,
+        firstName: "Legal",
+        lastName: "Admin",
+        agreeToTerms: true,
+        avatarUrl: null,
+      }),
+    );
+    companyIds.push(admin.companyId);
+    const member = await runWithoutTenant(() =>
+      repo.registerExistingCompany({
+        email: `legal-member-${suffix}@example.com`,
+        firstName: "Legal",
+        lastName: "Member",
+        agreeToTerms: false,
+        avatarUrl: null,
+        companyId: admin.companyId,
+      }),
+    );
+    const auditRepo = new PrismaEventLogRepo({
+      dispatch: vi.fn().mockResolvedValue(undefined),
+    });
+    const eventService = new EventService([], auditRepo);
+    const versions = currentLegalDocumentVersions();
+    await runWithoutTenant(async () => {
+      await eventService.publish(
+        DomainEvent.LEGAL_NOTICE_SENT,
+        {
+          entityId: admin.id,
+          payload: {
+            versions,
+            changedDocuments: ["terms", "dpa", "privacy", "subprocessors"],
+            recipientEmail: admin.email,
+            effectiveAt: "2026-08-06T00:00:00.000Z",
+          },
+        },
+        { systemCompanyId: admin.companyId, systemUserId: admin.id },
+      );
+      await eventService.publish(
+        DomainEvent.LEGAL_NOTICE_SENT,
+        {
+          entityId: member.id,
+          payload: {
+            versions,
+            changedDocuments: ["privacy"],
+            recipientEmail: member.email,
+            effectiveAt: null,
+          },
+        },
+        { systemCompanyId: admin.companyId, systemUserId: member.id },
+      );
+    });
+
+    await runWithoutTenant(() =>
+      prisma.eventLog.create({
+        data: {
+          companyId: admin.companyId,
+          subjectId: admin.companyId,
+          subjectKind: "legal",
+          kind: DomainEvent.LEGAL_DOCUMENTS_ACCEPTED,
+          payload: { versions },
+          actorId: admin.id,
+        },
+      }),
+    );
+
+    const statusInteractor = new GetLegalStatusInteractor(auditRepo);
+    const afterDeadline = new Date("2026-08-07T00:00:00.000Z");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(afterDeadline);
+    try {
+      activeTenantUser.value = admin;
+      await expect(statusInteractor.invoke()).resolves.toMatchObject({
+        contractAccepted: false,
+        mustAccept: true,
+      });
+      activeTenantUser.value = member;
+      await expect(statusInteractor.invoke()).resolves.toMatchObject({
+        contractAccepted: false,
+        mustAccept: true,
+      });
+
+      activeTenantUser.value = admin;
+      await new AcceptLegalDocumentsInteractor(auditRepo, eventService).invoke({
+        agreeToLegalDocuments: true,
+      });
+
+      await expect(statusInteractor.invoke()).resolves.toMatchObject({
+        contractAccepted: true,
+        mustAccept: false,
+      });
+      activeTenantUser.value = member;
+      await expect(statusInteractor.invoke()).resolves.toMatchObject({
+        contractAccepted: true,
+        mustAccept: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("rolls back the company, user, and queued acceptance evidence together", async () => {
+    const rollbackEmail = `legal-rollback-${Date.now()}@example.com`;
+    const authUserId = `auth-rollback-${Date.now()}`;
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: {
+          id: authUserId,
+          name: "Rollback Check",
+          email: rollbackEmail,
+          companyId: null,
+        },
+      }),
+    );
+    authUserIds.push(authUserId);
+    const failingRegistrationListener = {
+      handlers: {
+        [DomainEvent.USER_REGISTERED]: () => Promise.reject(new Error("forced registration rollback")),
+      },
+      handle(...args: Parameters<InstanceType<typeof DomainEventListener>["handle"]>) {
+        return DomainEventListener.prototype.handle.call(this, ...args);
+      },
+      handles(...args: Parameters<InstanceType<typeof DomainEventListener>["handles"]>) {
+        return DomainEventListener.prototype.handles.call(this, ...args);
+      },
+    };
+    const eventService = new EventService(
+      [failingRegistrationListener],
+      new PrismaEventLogRepo({ dispatch: () => Promise.resolve() }),
+    );
+    const interactor = new RegisterUserInteractor(
+      {
+        sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+      } as never,
+      new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo()),
+      eventService,
+      unregisteredRouteGuardService(authUserId, rollbackEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    );
+
+    await expect(
+      interactor.invoke(
+        {
+          email: rollbackEmail,
+          firstName: "Rollback",
+          lastName: "Check",
+          agreeToTerms: true,
+          avatarUrl: null,
+        },
+        { target: { type: "createCompany" } },
+      ),
+    ).rejects.toThrow("forced registration rollback");
+
+    expect(await runWithoutTenant(() => prisma.user.findFirst({ where: { email: rollbackEmail } }))).toBeNull();
+    expect(
+      await runWithoutTenant(() =>
+        prisma.authUser.findUniqueOrThrow({
+          where: { id: authUserId },
+          select: { companyId: true },
+        }),
+      ),
+    ).toEqual({ companyId: null });
+    expect(
+      await runWithoutTenant(() =>
+        prisma.eventLog.count({
+          where: {
+            kind: DomainEvent.LEGAL_DOCUMENTS_ACCEPTED,
+            payload: {
+              path: ["acceptingEmail"],
+              equals: rollbackEmail,
+            },
+          },
+        }),
+      ),
+    ).toBe(0);
+  });
+
+  it("names the first onboarding workspace and grants the trial only to the first workspace a login creates", async () => {
+    const ownerEmail = `named-workspace-${Date.now()}@example.com`;
+    const authUserId = `auth-named-${Date.now()}`;
+    await runWithoutTenant(() =>
+      prisma.authUser.create({
+        data: {
+          id: authUserId,
+          name: "Named Workspace",
+          email: ownerEmail,
+          companyId: null,
+        },
+      }),
+    );
+    authUserIds.push(authUserId);
+    const interactor = new RegisterUserInteractor(
+      {
+        sendNewUserNotificationEmail: vi.fn().mockResolvedValue(undefined),
+      } as never,
+      new PrismaUserRepo(new PermissionService(), new PrismaBillingUsageRepo()),
+      newEventService(),
+      unregisteredRouteGuardService(authUserId, ownerEmail) as never,
+      new PrismaCompanyRepo(new PrismaBillingUsageRepo()),
+      createTestWorkspaceRegistration(),
+    );
+    const profile = {
+      email: ownerEmail,
+      firstName: "Named",
+      lastName: "Owner",
+      agreeToTerms: true,
+      avatarUrl: null,
+    };
+    const workspaceOf = (companyId: string) =>
+      runWithoutTenant(() =>
+        prisma.company.findUniqueOrThrow({
+          where: { id: companyId },
+          select: {
+            name: true,
+            createdByAuthUserId: true,
+            subscription: { select: { status: true, trialEndDate: true } },
+          },
+        }),
+      );
+
+    await expect(
+      interactor.invoke({ ...profile, workspaceName: "  Bergmann Steuern  " }, { target: { type: "createCompany" } }),
+    ).resolves.toEqual({
+      ok: true,
+      data: { redirectTo: "/onboarding/wizard" },
+    });
+    const first = await runWithoutTenant(() => prisma.user.findFirstOrThrow({ where: { email: ownerEmail } }));
+    companyIds.push(first.companyId);
+    const firstWorkspace = await workspaceOf(first.companyId);
+    expect(firstWorkspace).toMatchObject({
+      name: "Bergmann Steuern",
+      createdByAuthUserId: authUserId,
+      subscription: { status: "trial" },
+    });
+    expect(firstWorkspace.subscription?.trialEndDate).not.toBeNull();
+
+    await runWithoutTenant(() =>
+      prisma.user.update({
+        where: { id: first.id },
+        data: { status: "inactive", leftAt: new Date() },
+      }),
+    );
+    await runWithoutTenant(() =>
+      prisma.authUser.update({
+        where: { id: authUserId },
+        data: { companyId: null },
+      }),
+    );
+
+    await expect(
+      interactor.invoke({ ...profile, workspaceName: "" }, { target: { type: "createCompany" } }),
+    ).resolves.toEqual({
+      ok: true,
+      data: { redirectTo: "/onboarding/wizard" },
+    });
+    const second = await runWithoutTenant(() =>
+      prisma.user.findFirstOrThrow({
+        where: { email: ownerEmail, leftAt: null },
+      }),
+    );
+    companyIds.push(second.companyId);
+    expect(second.companyId).not.toBe(first.companyId);
+    expect(await workspaceOf(second.companyId)).toEqual({
+      name: null,
+      createdByAuthUserId: authUserId,
+      subscription: { status: "expired", trialEndDate: null },
+    });
+  });
+});
