@@ -1,0 +1,91 @@
+import { describe, expect, it, vi } from "vitest";
+
+import { createMockUser } from "@/tests/helpers/mock-user";
+import { runWithTenant, runWithoutTenant } from "@/core/decorators/tenant-context";
+import { Action, Resource } from "@/generated/prisma";
+
+import type { FindUserRepo } from "../find-user.repo";
+import { UserService } from "../user.service";
+
+const sessionUser = createMockUser({ id: "session-user" });
+const tenantUser = createMockUser({ id: "tenant-user" });
+
+function service(overrides: Partial<FindUserRepo> = {}) {
+  const repo = {
+    findAuthUserAccountStateUnscoped: vi.fn().mockResolvedValue({ companyId: null, emailVerified: true }),
+    findCurrentUserUnscoped: vi.fn(),
+    findCurrentUserOrThrowUnscoped: vi.fn().mockResolvedValue(sessionUser),
+    findUserByIdOrThrowUnscoped: vi.fn().mockResolvedValue(tenantUser),
+    touchLastActiveUnscoped: vi.fn().mockResolvedValue(undefined),
+    ...overrides,
+  } as unknown as FindUserRepo;
+  const authService = {
+    getSession: vi.fn().mockResolvedValue({ user: { email: "session@example.com", emailVerified: true } }),
+    isIntegrationCredentialRequest: vi.fn().mockResolvedValue(false),
+  };
+
+  return new UserService(
+    authService as never,
+    repo,
+    {
+      requireMembership: () =>
+        (
+          repo as unknown as { findCurrentUserOrThrowUnscoped: () => Promise<unknown> }
+        ).findCurrentUserOrThrowUnscoped(),
+    } as never,
+    { canUseIntegrations: vi.fn().mockResolvedValue(true) },
+  );
+}
+
+describe("resolving the user an operation runs as", () => {
+  it("prefers the established tenant identity over a session lookup", async () => {
+    const users = service();
+
+    const resolved = await runWithTenant(tenantUser, () => users.getActiveTenantUserOrThrow());
+
+    expect(resolved.id).toBe("tenant-user");
+  });
+
+  it("falls back to the session when nothing established an identity", async () => {
+    const users = service();
+
+    const resolved = await users.getActiveTenantUserOrThrow();
+
+    expect(resolved.id).toBe("session-user");
+  });
+
+  it("refuses an established identity that is no longer active", async () => {
+    const users = service();
+    const inactive = createMockUser({ id: "inactive", status: "inactive" as never });
+
+    await expect(runWithTenant(inactive, () => users.getActiveTenantUserOrThrow())).rejects.toThrow("not active");
+  });
+
+  it("still demands a session when the tenant guard is bypassed rather than assumed", async () => {
+    const users = service();
+
+    const resolved = await runWithoutTenant(() => users.getActiveTenantUserOrThrow());
+
+    expect(resolved.id).toBe("session-user");
+  });
+
+  it("reads permissions off the resolved user without another session round trip", async () => {
+    const users = service();
+    const withRole = createMockUser({
+      id: "scoped",
+      role: {
+        id: "r",
+        isSystemRole: false,
+        permissions: [{ resource: Resource.routines, action: Action.readAll }],
+      } as never,
+    });
+
+    expect(await runWithTenant(withRole, () => users.hasPermission(Resource.routines, Action.readAll))).toBe(true);
+    expect(await runWithTenant(withRole, () => users.hasPermission(Resource.wiki, Action.readAll))).toBe(false);
+    expect(
+      await runWithTenant({ ...withRole, role: null } as never, () =>
+        users.hasPermission(Resource.routines, Action.readAll),
+      ),
+    ).toBe(false);
+  });
+});
