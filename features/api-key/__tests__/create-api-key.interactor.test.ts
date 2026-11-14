@@ -1,0 +1,181 @@
+import type { AuthService } from "@/features/auth/auth.service";
+
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { createMockUser } from "@/tests/helpers/mock-user";
+import {
+  createMockDiModule,
+  MOCK_ENV_MODULE,
+  MOCK_PRISMA_DB_MODULE,
+  MOCK_ZOD_MODULE,
+} from "@/tests/helpers/interactor-test-setup";
+
+const mockUser = createMockUser();
+
+vi.mock("@/env", () => MOCK_ENV_MODULE);
+vi.mock("@/core/di", () => createMockDiModule(() => mockUser));
+vi.mock("@/core/validation/zod-error-map-server", () => MOCK_ZOD_MODULE);
+vi.mock("@/prisma/db", () => MOCK_PRISMA_DB_MODULE);
+vi.mock("next-intl/server", () => ({
+  getTranslations: (namespace?: string) => {
+    const t = (key: string) => (namespace ? `${namespace}.${key}` : key);
+    return Promise.resolve(Object.assign(t, { raw: t }));
+  },
+  getLocale: () => Promise.resolve("en"),
+}));
+
+import { CreateApiKeyInteractor } from "../create-api-key.interactor";
+import { API_KEY_MAX_EXPIRATION_SECONDS, API_KEY_MIN_EXPIRATION_SECONDS } from "../api-key-expiration";
+import { API_KEY_NAME_MAX_LENGTH } from "../api-key-name";
+import { CustomErrorCode } from "@/core/validation/validation.types";
+
+const createdApiKey = {
+  id: "key-id",
+  key: "one-time-secret",
+  name: "Synthetic integration",
+  createdAt: new Date("2026-08-25T10:00:00.000Z"),
+  expiresAt: null,
+  lastRequest: null,
+};
+
+function makeInteractor(canCreateIntegrations = true) {
+  const createApiKey = vi.fn().mockResolvedValue({ ok: true, data: createdApiKey });
+  const plans = { canCreateIntegrations: vi.fn().mockResolvedValue(canCreateIntegrations) };
+  const interactor = new CreateApiKeyInteractor({ createApiKey } as unknown as AuthService, plans);
+
+  return { createApiKey, interactor, plans };
+}
+
+beforeEach(() => vi.clearAllMocks());
+
+describe("CreateApiKeyInteractor plan contract", () => {
+  it("refuses a new key while the workspace has no usable plan", async () => {
+    const { createApiKey, interactor, plans } = makeInteractor(false);
+
+    const result = await interactor.invoke({ name: "Synthetic integration", expiresIn: undefined });
+
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok)
+      expect(result.error.issues[0]).toMatchObject({ params: { error: CustomErrorCode.workspacePlanRequired } });
+    expect(plans.canCreateIntegrations).toHaveBeenCalledWith(mockUser.companyId);
+    expect(createApiKey).not.toHaveBeenCalled();
+  });
+});
+
+describe("CreateApiKeyInteractor expiration contract", () => {
+  it.each([undefined, API_KEY_MIN_EXPIRATION_SECONDS, API_KEY_MAX_EXPIRATION_SECONDS])(
+    "accepts an exact supported expiration of %s",
+    async (expiresIn) => {
+      const { createApiKey, interactor } = makeInteractor();
+
+      const result = await interactor.invoke({ name: "Synthetic integration", expiresIn });
+
+      expect(result).toMatchObject({ ok: true });
+      expect(createApiKey).toHaveBeenCalledExactlyOnceWith({
+        name: "Synthetic integration",
+        expiresIn,
+        companyId: expect.any(String),
+      });
+    },
+  );
+
+  it.each([
+    [API_KEY_MIN_EXPIRATION_SECONDS - 1, CustomErrorCode.apiKeyMinExpiration],
+    [API_KEY_MAX_EXPIRATION_SECONDS + 1, CustomErrorCode.apiKeyMaxExpiration],
+  ])("rejects an out-of-range expiration of %s", async (expiresIn, error) => {
+    const { createApiKey, interactor } = makeInteractor();
+
+    const result = await interactor.invoke({ name: "Synthetic integration", expiresIn });
+
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) expect(result.error.issues[0]).toMatchObject({ path: ["expiresIn"], params: { error } });
+    expect(createApiKey).not.toHaveBeenCalled();
+  });
+
+  it("rejects fractional seconds before calling Better Auth", async () => {
+    const { createApiKey, interactor } = makeInteractor();
+
+    const result = await interactor.invoke({
+      name: "Synthetic integration",
+      expiresIn: API_KEY_MIN_EXPIRATION_SECONDS + 0.5,
+    });
+
+    expect(result).toMatchObject({ ok: false });
+    expect(createApiKey).not.toHaveBeenCalled();
+  });
+
+  it.each([CustomErrorCode.apiKeyMinExpiration, CustomErrorCode.apiKeyMaxExpiration])(
+    "returns the Better Auth fallback %s as field validation",
+    async (error) => {
+      const { createApiKey, interactor } = makeInteractor();
+      createApiKey.mockResolvedValueOnce({ ok: false, error });
+
+      const result = await interactor.invoke({
+        name: "Synthetic integration",
+        expiresIn: API_KEY_MIN_EXPIRATION_SECONDS,
+      });
+
+      expect(result).toMatchObject({ ok: false });
+      if (!result.ok) {
+        expect(result.error.issues[0]).toMatchObject({
+          message: `Common.errors.${error}`,
+          path: ["expiresIn"],
+          params: { error },
+        });
+      }
+    },
+  );
+});
+
+describe("CreateApiKeyInteractor name contract", () => {
+  it("accepts a name at the schema boundary of the documented maximum length", async () => {
+    const { createApiKey, interactor } = makeInteractor();
+    const name = "n".repeat(API_KEY_NAME_MAX_LENGTH);
+
+    const result = await interactor.invoke({ name, expiresIn: undefined });
+
+    expect(result).toMatchObject({ ok: true });
+    expect(createApiKey).toHaveBeenCalledExactlyOnceWith({ name, expiresIn: undefined, companyId: expect.any(String) });
+  });
+
+  it("rejects a name past the maximum length before calling Better Auth", async () => {
+    const { createApiKey, interactor } = makeInteractor();
+
+    const result = await interactor.invoke({ name: "n".repeat(API_KEY_NAME_MAX_LENGTH + 1), expiresIn: undefined });
+
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) expect(result.error.issues[0]).toMatchObject({ path: ["name"] });
+    expect(createApiKey).not.toHaveBeenCalled();
+  });
+
+  it.each(["", "   "])("rejects the blank name %j before calling Better Auth", async (name) => {
+    const { createApiKey, interactor } = makeInteractor();
+
+    const result = await interactor.invoke({ name, expiresIn: undefined });
+
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) {
+      expect(result.error.issues[0]).toMatchObject({
+        path: ["name"],
+        params: { error: CustomErrorCode.mustNotBeBlank },
+      });
+    }
+    expect(createApiKey).not.toHaveBeenCalled();
+  });
+
+  it("returns the Better Auth name length fallback as a name field error", async () => {
+    const { createApiKey, interactor } = makeInteractor();
+    createApiKey.mockResolvedValueOnce({ ok: false, error: CustomErrorCode.apiKeyNameLength });
+
+    const result = await interactor.invoke({ name: "Synthetic integration", expiresIn: undefined });
+
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) {
+      expect(result.error.issues[0]).toMatchObject({
+        message: `Common.errors.${CustomErrorCode.apiKeyNameLength}`,
+        path: ["name"],
+        params: { error: CustomErrorCode.apiKeyNameLength },
+      });
+    }
+  });
+});
