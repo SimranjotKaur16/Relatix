@@ -1,0 +1,258 @@
+import type { RepoArgs } from "@/core/utils/types";
+import type { RecordRoleRepo } from "./record-role.repo";
+import type { RegisterUserRoleRepo } from "@/features/user/register/register-user-role.repo";
+import type { UpsertRoleRepo } from "@/features/role/upsert-role.repo";
+import type { GetRolesRepo } from "@/features/role/get-roles.repo";
+import type { DeleteRoleRepo } from "./delete-role.repo";
+import type { UpdateUserRoleRepo } from "@/features/user/upsert/update-user-role.repo";
+import type { FindRolesByIdsRepo } from "./find-roles-by-ids.repo";
+import type { BillingUsageRepo } from "@/features/billing-usage/billing-usage.repo";
+
+import { Action, Resource } from "@/generated/prisma";
+
+import type { Prisma } from "@/generated/prisma";
+
+import { QueryRepository } from "@/core/base/query-repository";
+import { rolePermits } from "@/core/base/permission.service";
+import {
+  IMPLICIT_READ_ACTIONS,
+  IMPLICIT_READ_RESOURCES,
+  MANAGE_ACTIONS,
+  manageImpliesReadAll,
+} from "@/features/role/resource-access";
+import { Transaction } from "@/core/decorators/transaction.decorator";
+import { type GetQueryParams } from "@/core/base/base-get.schema";
+
+function roleDto<T extends { recordTypeGrants: Array<{ typeId: string; actions: Action[] }> }>(role: T) {
+  const { recordTypeGrants, ...rest } = role;
+  return { ...rest, recordGrants: recordTypeGrants };
+}
+
+export function mapRoleWithAssignments<T extends { _count: { users: number } }>(role: T) {
+  const { _count, ...data } = role;
+
+  return { ...data, hasUsersAssigned: _count.users > 0 };
+}
+
+export class PrismaRoleRepo
+  extends QueryRepository
+  implements
+    UpsertRoleRepo,
+    GetRolesRepo,
+    DeleteRoleRepo,
+    UpdateUserRoleRepo,
+    FindRolesByIdsRepo,
+    RecordRoleRepo,
+    RegisterUserRoleRepo
+{
+  constructor(private readonly billingUsage: BillingUsageRepo) {
+    super();
+  }
+
+  async createAdminRole(companyId: string) {
+    const role = await this.prisma.userRole.create({
+      data: {
+        name: "Admin",
+        description: "Full access to all features and settings",
+        isSystemRole: true,
+        companyId,
+      },
+    });
+    return role.id;
+  }
+
+  private get baseSelect() {
+    return {
+      id: true,
+      name: true,
+      description: true,
+      isSystemRole: true,
+      createdAt: true,
+      updatedAt: true,
+      permissions: {
+        select: {
+          id: true,
+          resource: true,
+          action: true,
+        },
+      },
+    } as const;
+  }
+
+  private get withRecordGrantsSelect() {
+    return { ...this.baseSelect, recordTypeGrants: { select: { typeId: true, actions: true } } } as const;
+  }
+
+  private get withAssignmentsSelect() {
+    return {
+      ...this.baseSelect,
+      _count: {
+        select: {
+          users: true,
+        },
+      },
+    } as const;
+  }
+
+  private get visibleRolesWhere() {
+    const { companyId, role, roleId } = this.user;
+    return rolePermits(role, Resource.users, Action.update)
+      ? { companyId }
+      : { companyId, id: { in: roleId ? [roleId] : [] } };
+  }
+
+  getSortableFields() {
+    return [{ field: "type", resolvedFields: ["isSystemRole", "name"], collate: true }];
+  }
+
+  async getItems(params: GetQueryParams) {
+    return this.list({
+      model: "userRole",
+      baseWhere: this.visibleRolesWhere,
+      select: this.withAssignmentsSelect,
+      params,
+      map: (role: Prisma.UserRoleGetPayload<{ select: PrismaRoleRepo["withAssignmentsSelect"] }>) =>
+        mapRoleWithAssignments(role),
+    });
+  }
+
+  async getCount() {
+    return await this.prisma.userRole.count({ where: this.visibleRolesWhere });
+  }
+
+  async isRoleNameTaken(name: string, exceptId?: string) {
+    const { companyId } = this.user;
+
+    const role = await this.prisma.userRole.findFirst({
+      where: { companyId, name, ...(exceptId ? { NOT: { id: exceptId } } : {}) },
+      select: { id: true },
+    });
+
+    return role !== null;
+  }
+
+  @Transaction
+  async upsertRoleOrThrow(args: RepoArgs<UpsertRoleRepo, "upsertRoleOrThrow">) {
+    const { companyId } = this.user;
+
+    if (args.id) await this.prisma.userRole.findFirstOrThrow({ where: { id: args.id, companyId } });
+
+    const roleData = {
+      name: args.name,
+      description: args.description,
+      isSystemRole: false,
+      companyId,
+    };
+
+    const savedRole = await this.prisma.userRole.upsert({
+      where: {
+        id: args.id ?? "",
+        companyId,
+      },
+      create: roleData,
+      update: roleData,
+    });
+    if (args.id) await this.billingUsage.recordSeats(companyId, []);
+
+    for (const { resource, actions } of args.permissions) {
+      const stored = new Set(actions);
+      if (manageImpliesReadAll(resource) && MANAGE_ACTIONS.some((action) => stored.has(action)))
+        stored.add(Action.readAll);
+      await this.prisma.rolePermission.deleteMany({ where: { companyId, roleId: savedRole.id, resource } });
+      await this.prisma.rolePermission.createMany({
+        data: [...stored].map((action) => ({ roleId: savedRole.id, companyId, resource, action })),
+      });
+    }
+
+    await this.prisma.rolePermission.createMany({
+      data: IMPLICIT_READ_RESOURCES.flatMap((resource) =>
+        IMPLICIT_READ_ACTIONS.map((action) => ({ roleId: savedRole.id, companyId, resource, action })),
+      ),
+      skipDuplicates: true,
+    });
+
+    const role = await this.prisma.userRole.findFirstOrThrow({
+      where: { id: savedRole.id, companyId },
+      select: this.withRecordGrantsSelect,
+    });
+
+    return roleDto(role);
+  }
+
+  async hasAnotherActiveSystemRoleUser(excludeUserId: string) {
+    const { companyId } = this.user;
+
+    const systemRole = await this.prisma.userRole.findFirst({ where: { companyId, isSystemRole: true } });
+
+    if (!systemRole) return false;
+
+    const count = await this.prisma.user.count({
+      where: { companyId, id: { not: excludeUserId }, status: "active", leftAt: null, roleId: systemRole.id },
+    });
+
+    return count > 0;
+  }
+
+  async hasUsersAssigned(id: string) {
+    const { companyId } = this.user;
+
+    const usersWithRole = await this.prisma.user.count({
+      where: { roleId: id, companyId },
+    });
+
+    return usersWithRole > 0;
+  }
+
+  async getRoleByIdOrThrow(id: string) {
+    const { companyId } = this.user;
+
+    const role = await this.prisma.userRole.findFirstOrThrow({
+      where: { id, companyId },
+      select: this.withRecordGrantsSelect,
+    });
+
+    return roleDto(role);
+  }
+
+  async findRoleById(id: string) {
+    const role = await this.prisma.userRole.findFirst({
+      where: { id, companyId: this.companyId },
+      select: this.withRecordGrantsSelect,
+    });
+    return role ? roleDto(role) : null;
+  }
+
+  async findIds(ids: Set<string>) {
+    if (ids.size === 0) return new Set<string>();
+
+    const { companyId } = this.user;
+
+    const roles = await this.prisma.userRole.findMany({
+      where: { id: { in: Array.from(ids) }, companyId },
+      select: { id: true },
+    });
+
+    return new Set(roles.map((role) => role.id));
+  }
+
+  @Transaction
+  async deleteRoleOrThrow(id: string) {
+    const { companyId } = this.user;
+
+    const role = await this.prisma.userRole.findFirstOrThrow({
+      where: { id, companyId },
+      select: this.withRecordGrantsSelect,
+    });
+
+    await this.prisma.userRole.deleteMany({
+      where: { id, companyId },
+    });
+    await this.billingUsage.recordSeats(companyId, []);
+
+    return roleDto(role);
+  }
+
+  async countRolesCompanyWide(companyId: string, roleIds: string[]) {
+    return this.prisma.userRole.count({ where: { companyId, id: { in: roleIds } } });
+  }
+}
