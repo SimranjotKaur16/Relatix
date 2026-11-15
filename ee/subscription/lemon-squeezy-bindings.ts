@@ -1,0 +1,39 @@
+import "server-only";
+
+import type { CommercialOffer } from "@/core/commercial/plan-catalog";
+
+import { env } from "@/env";
+import {
+  LEMON_SQUEEZY_VARIANT_ENV_KEYS,
+  parseLemonSqueezyBindings,
+  type LemonSqueezyBindingEnvironment,
+} from "./lemon-squeezy-binding-contract";
+
+function runtimeBindingEnvironment(): LemonSqueezyBindingEnvironment {
+  const supportedKeys = new Set(Object.values(LEMON_SQUEEZY_VARIANT_ENV_KEYS));
+  return {
+    LEMONSQUEEZY_VARIANT_ID_STARTER: env.LEMONSQUEEZY_VARIANT_ID_STARTER,
+    LEMONSQUEEZY_VARIANT_ID_PRO: env.LEMONSQUEEZY_VARIANT_ID_PRO,
+    LEMONSQUEEZY_VARIANT_ID_BUSINESS: env.LEMONSQUEEZY_VARIANT_ID_BUSINESS,
+    LEMONSQUEEZY_VARIANT_ID_MAX: env.LEMONSQUEEZY_VARIANT_ID_MAX,
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([key]) => key.startsWith("LEMONSQUEEZY_VARIANT_ID_") && !supportedKeys.has(key as never),
+      ),
+    ),
+  } as LemonSqueezyBindingEnvironment;
+}
+
+export function offerToVariant(
+  offer: CommercialOffer,
+  input: LemonSqueezyBindingEnvironment = runtimeBindingEnvironment(),
+): string {
+  return parseLemonSqueezyBindings(input).byOffer[offer.id].checkoutVariantId;
+}
+
+export function variantToOffer(
+  variantId: string,
+  input: LemonSqueezyBindingEnvironment = runtimeBindingEnvironment(),
+): CommercialOffer | null {
+  return parseLemonSqueezyBindings(input).byVariant.get(variantId) ?? null;
+}
