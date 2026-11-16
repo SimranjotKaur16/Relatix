@@ -1,0 +1,446 @@
+import type { ReactNode } from "react";
+import type { BaseDataViewStore } from "@/core/base/base-data-view.store";
+import type { DataViewChipDto } from "@/core/data-view/data-view-state.schema";
+
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { ALL_VIEW_KEY } from "@/core/data-view/data-view-keys";
+
+const harness = vi.hoisted(() => ({
+  appMode: { current: "cloud" as "cloud" | "demo" | "self-hosted" },
+}));
+
+vi.mock("mobx-react-lite", () => ({ observer: <T>(component: T) => component }));
+vi.mock("next/navigation", () => ({
+  usePathname: () => "/en/deals",
+  useSearchParams: () => new URLSearchParams(),
+}));
+vi.mock("@/i18n/navigation", () => ({ useRouter: () => ({ push: vi.fn() }), usePathname: () => "/deals" }));
+vi.mock("next-intl", () => ({
+  useTranslations: () => (key: string, values?: Record<string, unknown>) =>
+    values ? `${key}(${Object.values(values).join(",")})` : key,
+}));
+vi.mock("@/core/stores/root-store.provider", () => ({
+  useRootStore: () => ({ appMode: harness.appMode.current, recordWorkspaceStore: { navigation: null } }),
+}));
+vi.mock("@/app/components/topbar-actions-context", () => ({}));
+
+import { DataViewViewsRail } from "../views/data-view-views-rail";
+
+type Item = { id: string };
+
+function view(overrides: Partial<DataViewChipDto> & { id: string }): DataViewChipDto {
+  return {
+    name: `View ${overrides.id}`,
+    position: 0,
+    state: {},
+    ...overrides,
+  };
+}
+
+const THREE_VIEWS = [
+  view({ id: "v-c", name: "Closing", position: 2 }),
+  view({ id: "v-a", name: "Ada", position: 0 }),
+  view({ id: "v-b", name: "Open deals", position: 1 }),
+];
+
+function store(overrides: Partial<BaseDataViewStore<Item>> = {}): BaseDataViewStore<Item> {
+  return {
+    activeViewKey: ALL_VIEW_KEY,
+    supportsSelection: true,
+    hasSelection: false,
+    isDisabled: false,
+    isReady: true,
+    p13nId: "deals-card-store",
+    pagination: { page: 1, pageSize: 25, total: 42 },
+    views: [],
+    ...overrides,
+  } as unknown as BaseDataViewStore<Item>;
+}
+
+function render(value: BaseDataViewStore<Item>, joinsTopBar = true): string {
+  return renderToStaticMarkup(
+    createElement(DataViewViewsRail<Item>, { joinsTopBar, store: value } as {
+      joinsTopBar: boolean;
+      store: BaseDataViewStore<Item>;
+    }) as ReactNode,
+  );
+}
+
+function countOf(html: string, needle: string): number {
+  return html.split(needle).length - 1;
+}
+
+function tabs(html: string): string[] {
+  return html.match(/<a [^>]*data-view-chip=""[^>]*>/g) ?? [];
+}
+
+function classesOf(markup: string): string[] {
+  return (markup.match(/class="([^"]*)"/)?.[1] ?? "").split(/\s+/).filter(Boolean);
+}
+
+function controlOf(html: string, id: string): string {
+  const open = html.match(new RegExp(`<button[^>]*id="${id}"[^>]*>`))?.[0] ?? "";
+  if (open === "") return "";
+
+  const start = html.indexOf(open);
+  return html.slice(start, html.indexOf("</button>", start));
+}
+
+function restingTabs(html: string): string[] {
+  return tabs(html).filter((tab) => !classesOf(tab).includes("bg-primary/20"));
+}
+
+const ANCHOR_IDS = ["global-data-views", "global-data-views-all", "global-data-views-menu", "global-data-views-new"];
+
+describe("data view rail", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    harness.appMode.current = "cloud";
+  });
+
+  it("renders nothing on a surface that offers no views", () => {
+    const html = render(store({ p13nId: undefined } as Partial<BaseDataViewStore<Item>>));
+
+    expect(html).toBe("");
+  });
+
+  it("marks itself as joined in the server markup, so the header boundary never double-draws", () => {
+    expect(render(store())).toContain("data-joins-top-bar");
+    expect(render(store(), false)).not.toContain("data-joins-top-bar");
+  });
+
+  it("renders the All tab, the create control and the view menu on an empty workspace", () => {
+    const html = render(store());
+
+    expect(tabs(html)).toHaveLength(1);
+    expect(tabs(html)[0]).toContain('id="global-data-views-all"');
+    expect(tabs(html)[0]).toContain('aria-current="page"');
+    expect(html).toContain(">DataView.views.all<");
+    expect(html).toContain('id="global-data-views-new"');
+    expect(html).toContain('id="global-data-views-menu"');
+    expect(countOf(html, 'id="global-data-views')).toBe(4);
+    expect(controlOf(html, "global-data-views-new")).toContain("DataView.views.createTitle");
+    expect(controlOf(html, "global-data-views-new")).not.toContain("aria-label");
+  });
+
+  it("always renders the All tab first, before the saved views, whatever view is active", () => {
+    for (const activeViewKey of [ALL_VIEW_KEY, "v-b", "gone"]) {
+      const html = render(store({ activeViewKey, views: THREE_VIEWS }));
+
+      expect(tabs(html), activeViewKey).toHaveLength(4);
+      expect(tabs(html)[0], activeViewKey).toContain('id="global-data-views-all"');
+      expect(tabs(html)[0], activeViewKey).toContain('href="/en/deals"');
+      expect(countOf(html, 'id="global-data-views-all"'), activeViewKey).toBe(1);
+    }
+    const labelled = renderToStaticMarkup(
+      createElement(DataViewViewsRail<Item>, {
+        allLabel: "Main",
+        joinsTopBar: true,
+        store: store({ views: THREE_VIEWS }),
+      } as {
+        allLabel: string;
+        joinsTopBar: boolean;
+        store: BaseDataViewStore<Item>;
+      }) as ReactNode,
+    );
+    expect(tabs(labelled)).toHaveLength(4);
+    expect(labelled).toContain(">Main<");
+    expect(labelled).toContain("DataView.views.applied(Main)");
+  });
+
+  it("names the All tab after the list, falling back to a plain All", () => {
+    const records = render(
+      store({ recordLabels: { singular: "Booking", plural: "Bookings" } } as Partial<BaseDataViewStore<Item>>),
+    );
+    const members = render(store({ p13nId: "users-card-store" }));
+    const inbox = render(store({ p13nId: "messaging-threads-card-store" }));
+
+    expect(records).toMatch(
+      /id="global-data-views-all"[^>]*><span class="truncate">DataView\.views\.allTab\.records\(Bookings\)</,
+    );
+    expect(members).toMatch(/id="global-data-views-all"[^>]*><span class="truncate">DataView\.views\.allTab\.members</);
+    expect(inbox).toMatch(
+      /id="global-data-views-all"[^>]*><span class="truncate">DataView\.views\.allTab\.conversations</,
+    );
+    expect(render(store())).toMatch(/id="global-data-views-all"[^>]*><span class="truncate">DataView\.views\.all</);
+  });
+
+  it("renders every view as a tab in position order and marks only the active one", () => {
+    const html = render(store({ activeViewKey: "v-b", views: THREE_VIEWS }));
+    const order = ["Ada", "Open deals", "Closing"].map((label) => html.indexOf(label));
+
+    expect(order.every((index) => index >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(tabs(html)).toHaveLength(4);
+    expect(countOf(html, "<a ")).toBe(4);
+    expect(countOf(html, 'aria-current="page"')).toBe(1);
+    expect(html).toMatch(/<a[^>]*aria-current="page"[^>]*>(?:(?!<\/a>).)*Open deals/s);
+    const selected = tabs(html).filter((tab) => classesOf(tab).includes("bg-primary/20"));
+    expect(selected).toHaveLength(1);
+    expect(selected[0]).toContain('aria-current="page"');
+    expect(classesOf(selected[0])).toContain("text-primary-soft-foreground");
+    expect(classesOf(selected[0])).toContain("border-primary/40");
+    expect(classesOf(selected[0])).not.toContain("text-muted-foreground");
+    expect(tabs(html).filter((tab) => classesOf(tab).includes("text-muted-foreground"))).toHaveLength(3);
+    const unselected = restingTabs(html);
+    expect(unselected).toHaveLength(3);
+    expect(unselected.every((tab) => classesOf(tab).includes("bg-secondary"))).toBe(true);
+    expect(unselected.every((tab) => tab.includes("hover:bg-accent hover:text-foreground"))).toBe(true);
+    expect(unselected.every((tab) => classesOf(tab).includes("shadow-xs"))).toBe(true);
+    expect(html).not.toContain("bg-selected");
+    expect(html).not.toContain("bg-muted/50");
+    expect(html).not.toContain("bg-foreground/10");
+    expect(html).not.toContain('data-slot="badge"');
+  });
+
+  it("gives every tab the pill geometry and a visible boundary", () => {
+    const html = render(store({ activeViewKey: "v-b", views: THREE_VIEWS }));
+
+    expect(tabs(html)).toHaveLength(4);
+    for (const tab of tabs(html)) {
+      expect(tab).toContain("h-7");
+      expect(tab).toContain("rounded-full");
+      expect(tab).toContain("px-2.5");
+      expect(tab).toContain("text-xs");
+      expect(tab).toContain("border ");
+      expect(tab).not.toContain("h-8");
+      expect(tab).not.toContain("rounded-md");
+    }
+  });
+
+  it("gives the resting tab the header toolbar button's background, border and shadow", () => {
+    const html = render(store({ activeViewKey: "v-b", views: THREE_VIEWS }));
+    const button = readFileSync(resolve(process.cwd(), "components/ui/button.tsx"), "utf8");
+    const secondary = (button.match(/secondary:\s*"([^"]*)"/)?.[1] ?? "").split(/\s+/).filter(Boolean);
+
+    expect(secondary).toContain("bg-secondary");
+
+    for (const token of ["border", "border-border", "bg-secondary", "shadow-xs", "hover:bg-accent"]) {
+      expect(secondary, token).toContain(token);
+      expect(
+        restingTabs(html).every((tab) => classesOf(tab).includes(token)),
+        token,
+      ).toBe(true);
+    }
+
+    expect(restingTabs(html).every((tab) => classesOf(tab).includes("text-muted-foreground"))).toBe(true);
+  });
+
+  it("holds the active tab's soft primary fill, rim and label through hover", () => {
+    const html = render(store({ activeViewKey: "v-b", views: THREE_VIEWS }));
+    const active = classesOf(tabs(html).filter((tab) => classesOf(tab).includes("bg-primary/20"))[0] ?? "");
+
+    expect(active).toContain("hover:bg-primary/20");
+    expect(active).toContain("hover:text-primary-soft-foreground");
+    expect(active).not.toContain("hover:bg-accent");
+    expect(active).not.toContain("hover:text-foreground");
+    expect(active).not.toContain("hover:text-accent-foreground");
+    expect(active).not.toContain("bg-primary");
+    expect(active).not.toContain("hover:bg-primary/35");
+  });
+
+  it("declares the active tab's label colour once per theme", () => {
+    const css = readFileSync(resolve(process.cwd(), "styles/globals.css"), "utf8");
+    const themes = css.split(/^\.dark,$/mu);
+    const declared = themes.map((block) => block.match(/--primary-soft-foreground:\s*(#[0-9a-f]{6});/u)?.[1]);
+
+    expect(themes).toHaveLength(2);
+    expect(css).toContain("--color-primary-soft-foreground: var(--primary-soft-foreground);");
+    expect(declared[0]).toBeDefined();
+    expect(declared[1]).toBeDefined();
+    expect(declared[0]).not.toBe(declared[1]);
+  });
+
+  it("gives the view menu control the shared ghost icon button with its chevron under the top bar", () => {
+    const html = render(store({ activeViewKey: "v-a", views: THREE_VIEWS }));
+    const control = controlOf(html, "global-data-views-menu");
+    const classes = classesOf(control);
+
+    expect(control).toContain("lucide-chevron-down");
+    expect(classes).toContain("size-7");
+    expect(control).toContain("hover:bg-accent");
+    for (const token of ["rounded-full", "bg-secondary", "shadow-xs", "border-border", "max-w-36"])
+      expect(classes, token).not.toContain(token);
+  });
+
+  it("sits flush inside a panel without border, background or padding and with a ghost view menu", () => {
+    const inline = render(store({ activeViewKey: "v-a", views: THREE_VIEWS }), false);
+    const rail = classesOf(inline.match(/<nav[^>]*>/)?.[0] ?? "");
+    const menu = classesOf(controlOf(inline, "global-data-views-menu"));
+    const joined = classesOf(
+      render(store({ activeViewKey: "v-a", views: THREE_VIEWS })).match(/<nav[^>]*>/)?.[0] ?? "",
+    );
+
+    for (const token of ["border-b", "border-border", "bg-background", "px-4"]) {
+      expect(rail, token).not.toContain(token);
+      expect(joined, token).toContain(token);
+    }
+    expect(menu).toContain("size-8");
+    for (const token of ["rounded-full", "bg-secondary", "shadow-xs", "border-border"])
+      expect(menu, token).not.toContain(token);
+  });
+
+  it("renders the create control as a dashed New view pill with no plus icon", () => {
+    const html = render(store({ activeViewKey: "v-a", views: THREE_VIEWS }));
+    const control = controlOf(html, "global-data-views-new");
+    const classes = classesOf(control);
+
+    expect(control).toContain("DataView.views.createTitle");
+    expect(control).not.toContain("lucide-plus");
+    expect(control).not.toContain("aria-label");
+    expect(control).not.toContain("data-view-draft");
+    expect(html).not.toContain("data-view-draft");
+    expect(classes).toContain("border-dashed");
+    expect(classes).toContain("border-input");
+    expect(classes).not.toContain("border-border");
+    expect(classes).toContain("bg-transparent");
+    expect(classes).not.toContain("bg-secondary");
+    expect(classes).toContain("shadow-none");
+    expect(classes).not.toContain("shadow-xs");
+    expect(classes).toContain("h-7");
+    expect(classes).toContain("rounded-full");
+    expect(classes).toContain("px-2.5");
+    expect(classes).toContain("flex-none");
+    expect(classes).not.toContain("size-7");
+    expect(classes).not.toContain("rounded-md");
+  });
+
+  it("sits flush under the top bar", () => {
+    const html = render(store({ activeViewKey: "v-a", views: THREE_VIEWS }));
+    const items = html.match(/<[^>]*data-data-view-rail-items[^>]*>/)?.[0] ?? "";
+
+    expect(items).toContain("pt-1");
+    expect(html).toContain("-mt-1 min-w-0 flex-1");
+    expect(items).toContain("pb-4");
+    expect(items).not.toContain("py-2.5");
+    expect(tabs(html).every((tab) => tab.includes("h-7"))).toBe(true);
+  });
+
+  it("starts its controls at the top edge so the actions control lines up with the tabs", () => {
+    const html = render(store({ activeViewKey: "v-a", views: THREE_VIEWS }));
+    const nav = html.match(/<nav[^>]*id="global-data-views"[^>]*>/)?.[0] ?? "";
+
+    expect(nav).toContain("items-start");
+    expect(nav).not.toContain("items-center");
+  });
+
+  it("renders every tab as a real link to its own view url, the active one included", () => {
+    const html = render(store({ activeViewKey: "v-b", views: THREE_VIEWS }));
+
+    for (const id of ["v-a", "v-b", "v-c"]) expect(html).toContain(`href="/en/deals?view=${id}"`);
+    expect(html).toMatch(/<a[^>]*aria-current="page"[^>]*href="\/en\/deals\?view=v-b"/);
+  });
+
+  it("keeps exactly one tab tabbable and points it at the active view, or the All tab", () => {
+    const active = render(store({ activeViewKey: "v-b", views: THREE_VIEWS }));
+    expect(countOf(active, 'tabindex="0"')).toBe(1);
+    expect(active).toMatch(/<a[^>]*tabindex="0"[^>]*>(?:(?!<\/a>).)*Open deals/s);
+    expect(countOf(active, 'tabindex="-1"')).toBe(3);
+
+    const all = render(store({ views: THREE_VIEWS }));
+    expect(countOf(all, 'tabindex="0"')).toBe(1);
+    expect(countOf(all, 'aria-current="page"')).toBe(1);
+    expect(all).toMatch(/<a[^>]*aria-current="page"[^>]*id="global-data-views-all"[^>]*tabindex="0"/s);
+  });
+
+  it("renders exactly the four reserved anchor ids once each on a rail with an active view", () => {
+    const html = render(store({ activeViewKey: "v-a", views: THREE_VIEWS }));
+
+    for (const id of ANCHOR_IDS) expect(countOf(html, `id="${id}"`), id).toBe(1);
+    expect(countOf(html, 'id="global-data-views'), "v-a").toBe(ANCHOR_IDS.length);
+    expect(html).toContain("data-data-view-rail=");
+  });
+
+  it("always offers the view menu, on All and on a saved view", () => {
+    expect(render(store({ activeViewKey: "v-a", views: THREE_VIEWS }))).toContain('id="global-data-views-menu"');
+    expect(render(store({ views: THREE_VIEWS }))).toContain('id="global-data-views-menu"');
+    expect(render(store())).toContain('id="global-data-views-menu"');
+  });
+
+  it("puts the modified dot on the All tab while All has unsaved changes", () => {
+    const html = render(store({ isViewModified: true, views: THREE_VIEWS } as Partial<BaseDataViewStore<Item>>));
+    const menu = html.match(/<button[^>]*id="global-data-views-menu"[^>]*>/)?.[0] ?? "";
+    const modified = tabs(html).filter((tab) => tab.includes("data-view-modified"));
+
+    expect(menu).not.toContain("data-view-modified");
+    expect(menu).not.toContain("aria-describedby");
+    expect(modified).toHaveLength(1);
+    expect(modified[0]).toContain('id="global-data-views-all"');
+  });
+
+  it("keeps the modified dot on the active view's tab instead of the menu", () => {
+    const html = render(
+      store({ activeViewKey: "v-b", isViewModified: true, views: THREE_VIEWS } as Partial<BaseDataViewStore<Item>>),
+    );
+    const menu = html.match(/<button[^>]*id="global-data-views-menu"[^>]*>/)?.[0] ?? "";
+
+    expect(menu).not.toContain("data-view-modified");
+    expect(menu).not.toContain("aria-describedby");
+    expect(tabs(html).filter((tab) => tab.includes("data-view-modified"))).toHaveLength(1);
+  });
+
+  it("gives a read only user the same rail as a manager", () => {
+    const managed = render(store({ activeViewKey: "v-a", views: THREE_VIEWS }));
+    const readOnly = render(store({ activeViewKey: "v-a", isDisabled: true, views: THREE_VIEWS }));
+
+    expect(readOnly).toBe(managed);
+  });
+
+  it("shows every write control in demo mode, because the interactor refuses the write and the toast explains it", () => {
+    harness.appMode.current = "demo";
+    const html = render(store({ activeViewKey: "v-a", views: THREE_VIEWS }));
+
+    expect(tabs(html)).toHaveLength(4);
+    expect(html).toContain("Open deals");
+    expect(html).toContain('id="global-data-views-new"');
+    expect(html).toContain('id="global-data-views-menu"');
+  });
+
+  it("renders the rail identically whatever the app mode, so demo hides nothing", () => {
+    harness.appMode.current = "cloud";
+    const cloud = render(store({ activeViewKey: "v-a", views: THREE_VIEWS }));
+
+    harness.appMode.current = "demo";
+    const demo = render(store({ activeViewKey: "v-a", views: THREE_VIEWS }));
+
+    expect(demo).toBe(cloud);
+  });
+
+  it("marks no tab active for an active key that matches no view", () => {
+    const html = render(store({ activeViewKey: "gone", views: THREE_VIEWS }));
+
+    expect(tabs(html)).toHaveLength(4);
+    expect(html).not.toContain('aria-current="page"');
+    expect(html).toContain('id="global-data-views-menu"');
+    expect(html).toContain("DataView.views.applied(DataView.views.all)");
+  });
+
+  it("announces the active view through the live region", () => {
+    expect(render(store({ views: THREE_VIEWS }))).toContain("DataView.views.applied(DataView.views.all)");
+    expect(render(store({ activeViewKey: "v-b", views: THREE_VIEWS }))).toContain("DataView.views.applied(Open deals)");
+  });
+
+  it("hides the rail below md while a selection is active", () => {
+    expect(render(store({ hasSelection: true, views: THREE_VIEWS }))).toContain("hidden md:flex");
+    expect(render(store({ hasSelection: true, supportsSelection: false, views: THREE_VIEWS }))).not.toContain(
+      "hidden md:flex",
+    );
+    expect(render(store({ views: THREE_VIEWS }))).not.toContain("hidden md:flex");
+  });
+
+  it("renders placeholders instead of tabs until the store is hydrated", () => {
+    const html = render(store({ isReady: false, views: THREE_VIEWS }));
+
+    expect(countOf(html, 'data-slot="skeleton"')).toBe(3);
+    expect(countOf(html, "h-7 w-20")).toBe(3);
+    expect(countOf(html, "rounded-full")).toBe(3);
+    expect(tabs(html)).toHaveLength(0);
+    expect(html).not.toContain('id="global-data-views-new"');
+    expect(html).toContain('id="global-data-views"');
+  });
+});
