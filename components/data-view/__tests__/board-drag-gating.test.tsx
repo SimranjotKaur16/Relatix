@@ -1,0 +1,323 @@
+import type { BaseDataViewStore } from "@/core/base/base-data-view.store";
+import type { DataViewGroup, GroupingResult } from "@/core/base/grouping/grouping.schema";
+import type { CustomColumnDto } from "@/core/data-view/column-presentation.schema";
+import type { DragEndEvent } from "@dnd-kit/core";
+import type { ReactNode } from "react";
+import type { Root } from "react-dom/client";
+
+import { act, createElement } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const { dndSpy } = vi.hoisted(() => ({
+  dndSpy: {
+    onDragEnd: undefined as ((event: DragEndEvent) => void) | undefined,
+    contextIds: [] as (string | undefined)[],
+    sensorCounts: [] as number[],
+    droppables: [] as { id: string; disabled: boolean }[],
+    draggables: [] as { id: string; disabled: boolean }[],
+    dragKeyDown: vi.fn(),
+    sensorOptions: [] as unknown[],
+  },
+}));
+
+vi.mock("@/i18n/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
+vi.mock("mobx-react-lite", () => ({ observer: <T,>(component: T) => component }));
+vi.mock("next-intl", () => ({
+  useTranslations: () => (key: string, values?: Record<string, unknown>) =>
+    values ? `${key}:${Object.values(values).join(",")}` : key,
+}));
+vi.mock("@/components/shared/use-navigate-to-href", () => ({
+  useNavigateToHref: () => vi.fn(),
+}));
+vi.mock("@/components/ui/tooltip", () => ({
+  Tooltip: ({ children }: { children: ReactNode }) => createElement("span", null, children),
+  TooltipContent: () => null,
+  TooltipProvider: ({ children }: { children: ReactNode }) => children,
+  TooltipTrigger: ({ children }: { children: ReactNode }) => children,
+}));
+vi.mock("@/core/stores/root-store.provider", () => ({
+  useRootStore: () => ({ customColumnModalStore: { openWithColumn: vi.fn() } }),
+}));
+vi.mock("@/core/stores/use-hydrated-intl-store", () => ({
+  useHydratedIntlStore: () => ({
+    formatCurrency: (amount: number) => `eur:${amount}`,
+    formatNumber: (value: number) => String(value),
+    formatMonthYear: () => "",
+    formatDescriptiveShortDate: () => "",
+  }),
+}));
+vi.mock("@/components/data-view/use-column-label", () => ({ useColumnLabel: () => (uid: string) => uid }));
+vi.mock("@dnd-kit/core", () => ({
+  DndContext: ({
+    children,
+    id,
+    onDragEnd,
+  }: {
+    children: ReactNode;
+    id?: string;
+    onDragEnd: (event: DragEndEvent) => void;
+  }) => {
+    dndSpy.onDragEnd = onDragEnd;
+    dndSpy.contextIds.push(id);
+    return createElement("div", null, children);
+  },
+  MouseSensor: function MouseSensor() {},
+  TouchSensor: function TouchSensor() {},
+  DragOverlay: ({ children }: { children?: ReactNode }) => children ?? null,
+  KeyboardSensor: function KeyboardSensor() {},
+  useSensor: (sensor: unknown, options?: unknown) => {
+    dndSpy.sensorOptions.push(options);
+    return { sensor };
+  },
+  useSensors: (...sensors: unknown[]) => {
+    const live = sensors.filter(Boolean);
+    dndSpy.sensorCounts.push(live.length);
+    return live;
+  },
+  useDraggable: ({ id, disabled }: { id: string; disabled?: boolean }) => {
+    dndSpy.draggables.push({ id, disabled: Boolean(disabled) });
+    return {
+      attributes: { role: "button", tabIndex: 0 },
+      listeners: { onKeyDown: dndSpy.dragKeyDown },
+      setNodeRef: () => undefined,
+      transform: null,
+      isDragging: false,
+    };
+  },
+  useDroppable: ({ id, disabled }: { id: string; disabled?: boolean }) => {
+    dndSpy.droppables.push({ id: String(id), disabled: Boolean(disabled) });
+    return { setNodeRef: () => undefined };
+  },
+}));
+
+import { DataKanbanView } from "../data-kanban-view";
+
+type Item = { id: string; name: string; totalValue?: number };
+
+const renderCard = (item: Item) => item.name;
+
+const ITEMS: Item[] = [{ id: "e-1", name: "Deal one", totalValue: 200 }];
+
+const STORED_COLUMN = {
+  id: "stage",
+  label: "Stage",
+  type: "singleSelect",
+  options: { options: [{ value: "new", label: "NEW", color: "info", index: 0 }] },
+} as unknown as CustomColumnDto;
+
+function group(overrides: Partial<DataViewGroup> & { key: string }): DataViewGroup {
+  return {
+    count: 0,
+    labelKind: "value",
+    isNoValue: false,
+    materialised: true,
+    itemIds: [],
+    hasMore: false,
+    ...overrides,
+  };
+}
+
+const GROUPS: DataViewGroup[] = [
+  group({ key: "new", count: 1, label: "NEW", color: "info", itemIds: ["e-1"] }),
+  group({ key: "won", count: 0, label: "WON", weight: 80 }),
+];
+
+const PROBABILITY_GROUPS: DataViewGroup[] = [
+  group({
+    key: "new",
+    count: 1,
+    label: "NEW",
+    itemIds: ["e-1"],
+  }),
+  group({ key: "won", count: 0, label: "WON", weight: 80 }),
+];
+
+function store(grouping: Partial<GroupingResult>, moveItemBetweenGroups = vi.fn()): BaseDataViewStore<Item> {
+  return {
+    customColumns: [STORED_COLUMN],
+    columnWidths: {},
+    entityType: "deal",
+    hiddenColumns: [],
+    isGrouped: true,
+    isRefreshing: false,
+    items: ITEMS,
+    groupingResult: {
+      grouping: { field: "stage" },
+      kind: "customSingleSelect",
+      supportsDragWriteBack: true,
+      columnId: "stage",
+      groups: GROUPS,
+      total: 1,
+      ...grouping,
+    },
+    loadMoreInGroup: vi.fn(),
+    isBoardStrip: () => false,
+    isGroupHidden: () => false,
+    hideGroup: vi.fn(),
+    toggleBoardStrip: vi.fn(),
+    canCreateInGroup: () => false,
+    createInGroup: vi.fn(),
+    groupEditHref: () => undefined,
+    moveItemBetweenGroups,
+  } as unknown as BaseDataViewStore<Item>;
+}
+
+const roots = new Set<Root>();
+
+function render(value: BaseDataViewStore<Item>, onCardClick?: (item: Item) => void): void {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const root = createRoot(host);
+  roots.add(root);
+  act(() => {
+    root.render(createElement(DataKanbanView<Item>, { renderCard, store: value, onCardClick }) as ReactNode);
+  });
+}
+
+beforeEach(() => {
+  dndSpy.onDragEnd = undefined;
+  dndSpy.contextIds = [];
+  dndSpy.sensorCounts = [];
+  dndSpy.droppables = [];
+  dndSpy.draggables = [];
+  dndSpy.dragKeyDown.mockReset();
+  dndSpy.sensorOptions = [];
+});
+
+afterEach(() => {
+  for (const root of roots) act(() => root.unmount());
+  roots.clear();
+  document.body.replaceChildren();
+});
+
+const dropEvent = (activeId: string, overId: string, groupKey: string) =>
+  ({
+    active: { id: activeId, data: { current: { groupKey } }, rect: { current: { initial: null, translated: null } } },
+    over: { id: overId, data: { current: undefined } },
+  }) as unknown as DragEndEvent;
+
+async function drop(activeId: string, overId: string, groupKey: string): Promise<void> {
+  await act(async () => {
+    await Promise.resolve(dndSpy.onDragEnd?.(dropEvent(activeId, overId, groupKey)));
+  });
+}
+
+describe("board card keyboard access", () => {
+  const press = (card: Element, key: string) =>
+    act(() => {
+      card.dispatchEvent(new KeyboardEvent("keydown", { key, code: key === " " ? "Space" : key, bubbles: true }));
+    });
+
+  it("opens a draggable card with Enter and leaves Space to pick it up", () => {
+    const open = vi.fn();
+    render(store({}), open);
+    const card = document.querySelector('[data-item-id="e-1"]');
+    if (!card) throw new Error("Expected a rendered card");
+    expect(card.getAttribute("tabindex")).toBe("0");
+    press(card, "Enter");
+    expect(open).toHaveBeenCalledExactlyOnceWith(ITEMS[0]);
+    expect(dndSpy.dragKeyDown).not.toHaveBeenCalled();
+    press(card, " ");
+    expect(open).toHaveBeenCalledOnce();
+    expect(dndSpy.dragKeyDown).toHaveBeenCalledOnce();
+    expect(dndSpy.sensorOptions).toContainEqual(
+      expect.objectContaining({ keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space", "Enter"] } }),
+    );
+  });
+});
+
+describe("board drag gating", () => {
+  it("names its drag context from a render-stable id, so the server and client agree on the card descriptions", () => {
+    render(store({ kind: "customSingleSelect", supportsDragWriteBack: true }));
+    render(store({ kind: "customSingleSelect", supportsDragWriteBack: true }));
+
+    expect(dndSpy.contextIds).toHaveLength(2);
+    for (const id of dndSpy.contextIds) expect(typeof id).toBe("string");
+    expect(dndSpy.contextIds.every((id) => (id ?? "").length > 0)).toBe(true);
+    expect(dndSpy.contextIds.some((id) => /^DndDescribedBy-|^\d+$/.test(id ?? ""))).toBe(false);
+  });
+
+  it("registers no sensor and no live drop target on a kind that cannot write back", async () => {
+    const moveItemBetweenGroups = vi.fn();
+    render(store({ kind: "relation", supportsDragWriteBack: false, columnId: undefined }, moveItemBetweenGroups));
+
+    expect(dndSpy.sensorCounts).toEqual([0]);
+    expect(dndSpy.droppables.every((droppable) => droppable.disabled)).toBe(true);
+    expect(dndSpy.draggables.every((draggable) => draggable.disabled)).toBe(true);
+
+    await drop("e-1", "won", "new");
+
+    expect(moveItemBetweenGroups).not.toHaveBeenCalled();
+  });
+
+  it("registers the pointer sensor and live targets when the server allows the write back", () => {
+    render(store({}));
+
+    expect(dndSpy.sensorCounts).toEqual([3]);
+    expect(
+      dndSpy.droppables
+        .filter((droppable) => !droppable.id.startsWith("card:"))
+        .some((droppable) => droppable.disabled),
+    ).toBe(false);
+    expect(dndSpy.draggables.some((draggable) => draggable.disabled)).toBe(false);
+  });
+
+  it("keeps protected records fixed even when ordinary records can move", async () => {
+    const moveItemBetweenGroups = vi.fn();
+    const value = store({}, moveItemBetweenGroups);
+    value.canMoveItemBetweenGroups = () => false;
+    render(value);
+    expect(dndSpy.draggables.every((draggable) => draggable.disabled)).toBe(true);
+    await drop("e-1", "won", "new");
+    expect(moveItemBetweenGroups).not.toHaveBeenCalled();
+  });
+
+  it("moves with the group key the card was rendered in, never a re-derived value", async () => {
+    const moveItemBetweenGroups = vi.fn();
+    render(store({}, moveItemBetweenGroups));
+
+    await drop("e-1", "won", "new");
+
+    expect(moveItemBetweenGroups).toHaveBeenCalledTimes(1);
+    expect(moveItemBetweenGroups.mock.calls[0][0]).toMatchObject({
+      fromGroupKey: "new",
+      toGroupKey: "won",
+      value: "won",
+    });
+  });
+
+  it("shows a supplied probability and moves the card to the dropped group", async () => {
+    const moveItemBetweenGroups = vi.fn();
+    render(store({ groups: PROBABILITY_GROUPS }, moveItemBetweenGroups));
+
+    expect(document.querySelector('[aria-label*="80%"]')).not.toBeNull();
+
+    await drop("e-1", "won", "new");
+
+    expect(moveItemBetweenGroups.mock.calls[0][0]).toMatchObject({ fromGroupKey: "new", toGroupKey: "won" });
+  });
+
+  it("ignores a drop back onto the group the card already sits in", async () => {
+    const moveItemBetweenGroups = vi.fn();
+    render(store({}, moveItemBetweenGroups));
+
+    await drop("e-1", "new", "new");
+
+    expect(moveItemBetweenGroups).not.toHaveBeenCalled();
+  });
+
+  it("clears the value when the card is dropped on the no-value column", async () => {
+    const moveItemBetweenGroups = vi.fn();
+    render(
+      store(
+        { groups: [...GROUPS, group({ key: "__empty__", count: 1, isNoValue: true, labelKind: "noValue" })] },
+        moveItemBetweenGroups,
+      ),
+    );
+
+    await drop("e-1", "__empty__", "new");
+
+    expect(moveItemBetweenGroups.mock.calls[0][0]).toMatchObject({ toGroupKey: "__empty__", value: null });
+  });
+});
