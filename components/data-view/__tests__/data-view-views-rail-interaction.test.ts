@@ -1,0 +1,1205 @@
+import type { ReactNode } from "react";
+import type { Root as ReactRoot } from "react-dom/client";
+import type { BaseDataViewStore } from "@/core/base/base-data-view.store";
+import type { DataViewChipDto, DataViewState } from "@/core/data-view/data-view-state.schema";
+
+import { act, createElement } from "react";
+import { createRoot } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { ALL_VIEW_KEY, SURFACE } from "@/core/data-view/data-view-keys";
+
+const TRASH_BATCH_ID = "40000000-0000-4000-8000-0000000000b1";
+const harness = vi.hoisted(() => ({
+  agent: {
+    enabled: true,
+    composerDraft: "",
+    composerContexts: [] as unknown[],
+    contextRegistry: {
+      candidates: vi.fn(() => []),
+      register: vi.fn(() => vi.fn()),
+    },
+    addComposerContext: vi.fn(),
+    open: vi.fn(),
+    openWithDraft: vi.fn<(draft: string) => void>(),
+    openWithContextDraft: vi.fn(),
+    viewContext: { register: vi.fn(() => vi.fn()) },
+  },
+  appMode: { current: "cloud" as "cloud" | "demo" | "self-hosted" },
+  calls: [] as string[],
+  confirmations: [] as { entityName?: string; onConfirm: () => Promise<boolean>; focusAfterConfirm?: () => boolean }[],
+  notices: [] as { message: string; details: string[] }[],
+  deleteDataViewAction: vi.fn(),
+  menuOpen: false,
+  menuCloseAutoFocus: { current: undefined as ((event: Event) => void) | undefined },
+  overlayCloseAutoFocus: { current: undefined as ((event: Event) => void) | undefined },
+  routerPush: vi.fn(),
+  searchParams: { current: "" },
+  upsertDataViewAction: vi.fn(),
+  viewPicker: {
+    surface: null as { options: () => readonly { id: string }[]; select: (viewKey: string) => void } | null,
+    register: vi.fn(),
+    unregister: vi.fn(),
+  },
+}));
+
+vi.mock("mobx-react-lite", () => ({ observer: <T>(component: T) => component }));
+vi.mock("next/navigation", () => ({
+  usePathname: () => "/en/records/10000000-0000-4000-8000-000000000103",
+  useSearchParams: () => new URLSearchParams(harness.searchParams.current),
+}));
+vi.mock("@/i18n/navigation", () => ({
+  useRouter: () => ({ push: harness.routerPush }),
+  usePathname: () => "/records/10000000-0000-4000-8000-000000000103",
+}));
+vi.mock("next-intl", () => ({
+  useTranslations: () => (key: string, values?: Record<string, unknown>) =>
+    values ? `${key}(${Object.values(values).join(",")})` : key,
+}));
+vi.mock("@/core/stores/root-store.provider", () => ({
+  useRootStore: () => ({
+    appMode: harness.appMode.current,
+    agentChatStore: harness.agent,
+    viewPickerStore: harness.viewPicker,
+  }),
+}));
+vi.mock("sonner", () => ({ toast: { error: vi.fn(), success: vi.fn() } }));
+vi.mock("@/app/actions", () => ({
+  deleteDataViewAction: (...args: unknown[]) => {
+    harness.calls.push("deleteDataViewAction");
+    return harness.deleteDataViewAction(...args);
+  },
+  upsertDataViewAction: (...args: unknown[]) => {
+    harness.calls.push("upsertDataViewAction");
+    return harness.upsertDataViewAction(...args);
+  },
+}));
+vi.mock("@/components/modal/hooks/use-delete-confirmation", () => ({
+  useDeleteConfirmation: () => ({
+    showConfirmation: (notice: { message: string; details: string[] }) => harness.notices.push(notice),
+    showTrashConfirmation: (
+      onConfirm: () => Promise<boolean>,
+      entityName?: string,
+      focusAfterConfirm?: () => boolean,
+    ) => harness.confirmations.push({ entityName, onConfirm, focusAfterConfirm }),
+  }),
+}));
+vi.mock("@/components/modal/responsive-overlay", () => ({
+  ResponsiveOverlay: ({
+    children,
+    footer,
+    headerAction,
+    open,
+    trigger,
+    onOpenChange,
+    onCloseAutoFocus,
+  }: {
+    children: ReactNode;
+    footer?: ReactNode;
+    headerAction?: ReactNode;
+    open: boolean;
+    trigger: ReactNode;
+    onOpenChange: (open: boolean) => void;
+    onCloseAutoFocus?: (event: Event) => void;
+  }) => {
+    harness.overlayCloseAutoFocus.current = onCloseAutoFocus;
+    return createElement(
+      "div",
+      null,
+      createElement("span", { onClick: () => onOpenChange(!open) }, trigger),
+      open ? headerAction : null,
+      open ? children : null,
+      open ? footer : null,
+    );
+  },
+}));
+vi.mock("@/components/ui/dropdown-menu", () => ({
+  DropdownMenu: ({ children, open }: { children: ReactNode; open: boolean }) => {
+    harness.menuOpen = open;
+    return createElement("div", null, children);
+  },
+  DropdownMenuContent: ({
+    children,
+    onCloseAutoFocus,
+  }: {
+    children: ReactNode;
+    onCloseAutoFocus?: (event: Event) => void;
+  }) => {
+    harness.menuCloseAutoFocus.current = onCloseAutoFocus;
+
+    return createElement("div", { "data-view-menu": "" }, children);
+  },
+  DropdownMenuSeparator: () => createElement("hr"),
+  DropdownMenuItem: ({
+    children,
+    disabled,
+    onSelect,
+    ...props
+  }: {
+    children: ReactNode;
+    disabled?: boolean;
+    onSelect: () => void;
+    id?: string;
+    "aria-label"?: string;
+  }) => createElement("button", { ...props, disabled, onClick: onSelect, type: "button" }, children),
+  DropdownMenuTrigger: ({ children }: { children: ReactNode }) => children,
+}));
+
+vi.mock("@/app/components/agent-chat/chat-ui", () => ({ focusAgentComposer: vi.fn() }));
+vi.mock("@/core/stores/use-hydrated-intl-store", () => ({
+  useHydratedIntlStore: () => ({ formatNumericalShortDate: () => "date" }),
+}));
+vi.mock("@/components/data-view/filter-modal/inputs/use-filter-select-items", () => ({
+  useFilterSelectItems: () => ({
+    items: [
+      { key: "cursor", value: "cursor", textValue: "Cursor" },
+      { key: "open", value: "open", textValue: "Open" },
+    ],
+    getItems: undefined,
+    isLoading: false,
+  }),
+}));
+
+import { DataViewViewsRail } from "../views/data-view-views-rail";
+import { focusAgentComposer } from "@/app/components/agent-chat/chat-ui";
+
+type Item = { id: string };
+
+function view(overrides: Partial<DataViewChipDto> & { id: string }): DataViewChipDto {
+  return {
+    name: `View ${overrides.id}`,
+    position: 0,
+    state: {},
+    ...overrides,
+  };
+}
+
+const ADA = view({ id: "v-a", name: "Ada", position: 0 });
+const OPEN = view({ id: "v-b", name: "Open deals", position: 1 });
+const CLOSING = view({ id: "v-c", name: "Closing", position: 2, state: { hiddenColumns: ["email"] } });
+const VIEWS = [ADA, OPEN, CLOSING];
+
+function store(overrides: Partial<BaseDataViewStore<Item>> = {}): BaseDataViewStore<Item> {
+  const fake: Record<string, any> = {
+    activeViewKey: ALL_VIEW_KEY,
+    applyView: vi.fn(() => harness.calls.push("applyView")),
+    discardPendingViewState: vi.fn(() => harness.calls.push("discardPendingViewState")),
+    columnOrder: [],
+    columnWidths: {},
+    supportsSelection: true,
+    filters: [],
+    grouping: null,
+    hasSelection: false,
+    hiddenColumns: [],
+    isDisabled: false,
+    isReady: true,
+    p13nId: "records:10000000-0000-4000-8000-000000000103",
+    viewTypeLabel: "Deals",
+    pagination: { page: 1, pageSize: 25, total: 42 },
+    refresh: vi.fn(() => {
+      harness.calls.push("refresh");
+      return Promise.resolve();
+    }),
+    searchTerm: "",
+    sortDescriptor: undefined,
+    viewMode: "table",
+    views: VIEWS,
+    isViewModified: false,
+    canSaveAsView: false,
+    get canSaveViewChanges() {
+      return Boolean(this.isViewModified);
+    },
+    registerSaveAsView: vi.fn((opener: () => void) => {
+      fake.openSaveAsView = opener;
+      return () => undefined;
+    }),
+    openSaveAsView: vi.fn(),
+    saveViewChanges: vi.fn(() => Promise.resolve()),
+    resetViewChanges: vi.fn(),
+    forgetQueryDraft: vi.fn(),
+    viewStateSnapshot: ({ includeQuery }: { includeQuery: boolean }): DataViewState => {
+      const saved =
+        (fake.views as DataViewChipDto[]).find((candidate) => candidate.id === fake.activeViewKey)?.state ?? {};
+      return {
+        columnOrder: fake.columnOrder,
+        columnWidths: fake.columnWidths,
+        filters: includeQuery ? fake.filters : (saved.filters ?? []),
+        grouping: fake.grouping,
+        hiddenColumns: fake.hiddenColumns,
+        pageSize: fake.pagination.pageSize,
+        searchTerm: (includeQuery ? fake.searchTerm : saved.searchTerm) ?? "",
+        sortDescriptor: fake.sortDescriptor ?? null,
+        viewMode: fake.viewMode,
+      };
+    },
+    ...overrides,
+  };
+  return fake as unknown as BaseDataViewStore<Item>;
+}
+
+let root: ReactRoot | undefined;
+let container: HTMLDivElement | undefined;
+
+function render(value: BaseDataViewStore<Item>, detailParam?: string): HTMLDivElement {
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+  act(() => {
+    root?.render(
+      createElement(DataViewViewsRail<Item>, { detailParam, store: value } as {
+        detailParam?: string;
+        store: BaseDataViewStore<Item>;
+      }) as ReactNode,
+    );
+  });
+  return container;
+}
+
+function chips(host: HTMLElement): HTMLAnchorElement[] {
+  return [...host.querySelectorAll<HTMLAnchorElement>("a[data-view-chip]")];
+}
+
+function menuLabels(host: HTMLElement): string[] {
+  return [...host.querySelectorAll<HTMLButtonElement>("[data-view-menu] button")].map(
+    (button) => button.textContent?.trim() ?? "",
+  );
+}
+
+function byText(host: HTMLElement, text: string): HTMLButtonElement {
+  const found = [...host.querySelectorAll<HTMLButtonElement>("button")].find(
+    (button) => button.textContent?.trim() === text,
+  );
+  if (!found) throw new Error(`no button labelled ${text}`);
+  return found;
+}
+
+function chooseFromMenu(host: HTMLElement, text: string): Event {
+  act(() => byText(host, text).click());
+  const closed = new Event("closeAutoFocus", { cancelable: true });
+  act(() => harness.menuCloseAutoFocus.current?.(closed));
+  return closed;
+}
+
+// eslint-disable-next-line @typescript-eslint/unbound-method -- the prototype setter must bypass React's value tracker so the controlled input sees the change
+const setNativeInputValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set as
+  | ((this: HTMLInputElement, value: string) => void)
+  | undefined;
+
+function typeInto(input: HTMLInputElement | null, value: string): void {
+  act(() => {
+    if (input) setNativeInputValue?.call(input, value);
+    input?.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+async function submitMetaForm(host: HTMLElement): Promise<void> {
+  await act(async () => {
+    host
+      .querySelector<HTMLFormElement>("#view-editor-form")
+      ?.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+    await Promise.resolve();
+  });
+}
+
+function press(target: HTMLElement, key: string): void {
+  act(() => {
+    target.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key }));
+  });
+}
+
+function swallowNavigation(event: Event): void {
+  event.preventDefault();
+}
+
+beforeEach(() => {
+  harness.agent.enabled = true;
+  harness.agent.composerDraft = "";
+  harness.agent.composerContexts = [];
+  harness.agent.open.mockReset();
+  harness.agent.openWithDraft.mockReset().mockImplementation((draft) => {
+    harness.agent.composerDraft = draft;
+  });
+  harness.agent.openWithContextDraft.mockReset().mockImplementation(({ context, draft }) => {
+    harness.agent.composerContexts = [context];
+    if (!harness.agent.composerDraft.trim()) harness.agent.composerDraft = draft;
+  });
+  harness.agent.addComposerContext.mockReset();
+  harness.agent.contextRegistry.candidates.mockReset().mockReturnValue([]);
+  harness.agent.contextRegistry.register.mockClear();
+  harness.agent.viewContext.register.mockClear();
+  harness.overlayCloseAutoFocus.current = undefined;
+  vi.mocked(focusAgentComposer).mockClear();
+  (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  harness.appMode.current = "cloud";
+  harness.calls.length = 0;
+  harness.confirmations.length = 0;
+  harness.notices.length = 0;
+  harness.deleteDataViewAction
+    .mockReset()
+    .mockResolvedValue({ data: { id: "v-a", trashBatchId: TRASH_BATCH_ID }, ok: true });
+  harness.routerPush.mockReset();
+  harness.searchParams.current = "";
+  harness.upsertDataViewAction.mockReset().mockResolvedValue({ data: view({ id: "v-new", name: "Hot" }), ok: true });
+  harness.viewPicker.surface = null;
+  harness.viewPicker.register.mockReset().mockImplementation((surface) => {
+    harness.viewPicker.surface = surface;
+  });
+  harness.viewPicker.unregister.mockReset().mockImplementation((surface) => {
+    if (harness.viewPicker.surface === surface) harness.viewPicker.surface = null;
+  });
+  window.history.replaceState(null, "", "/en/records/10000000-0000-4000-8000-000000000103");
+  document.addEventListener("click", swallowNavigation);
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      disconnect() {}
+      observe() {}
+      unobserve() {}
+    },
+  );
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: vi.fn() });
+});
+
+afterEach(() => {
+  document.removeEventListener("click", swallowNavigation);
+  act(() => root?.unmount());
+  container?.remove();
+  root = undefined;
+  container = undefined;
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+describe("data view rail interaction", () => {
+  it("does not replace the assistant context for a surface without saved views", () => {
+    const host = render(store({ p13nId: undefined }));
+    expect(host.querySelector("#global-data-views")).toBeNull();
+    expect(harness.agent.viewContext.register).not.toHaveBeenCalled();
+  });
+
+  it.each([SURFACE.operatorUsers, SURFACE.operatorWorkspaces, SURFACE.operatorAudit])(
+    "does not offer AI management on operator surface %s",
+    (surfaceKey) => {
+      const host = render(store({ p13nId: surfaceKey }));
+      expect(host.querySelector("#global-data-views-ai")).toBeNull();
+      act(() => host.querySelector<HTMLButtonElement>("#global-data-views-new")?.click());
+      expect(host.querySelector("#view-editor-ai")).toBeNull();
+      expect(harness.agent.viewContext.register).not.toHaveBeenCalled();
+    },
+  );
+
+  it("opens chat with the selected view attached and does not send", () => {
+    const host = render(store({ activeViewKey: OPEN.id }));
+    const button = host.querySelector<HTMLButtonElement>("#global-data-views-ai");
+    expect(button?.getAttribute("aria-label")).toBe("DataView.views.aiLabel(Open deals)");
+
+    act(() => button?.click());
+    expect(harness.agent.openWithContextDraft).not.toHaveBeenCalled();
+    const closeEvent = new Event("closeAutoFocus", { cancelable: true });
+    act(() => harness.menuCloseAutoFocus.current?.(closeEvent));
+
+    expect(closeEvent.defaultPrevented).toBe(true);
+    expect(harness.agent.openWithContextDraft).toHaveBeenCalledExactlyOnceWith({
+      context: {
+        label: "AgentChat.context.viewLabel(Open deals,AgentChat.context.surfaceViewTypeStandalone(Deals))",
+        reference: {
+          kind: "dataView",
+          requestedAction: "update",
+          surfaceKey: "records:10000000-0000-4000-8000-000000000103",
+          viewKey: OPEN.id,
+        },
+      },
+      draft: "AgentChat.context.starter.update(Open deals)",
+      pageRoute: `/en/records/10000000-0000-4000-8000-000000000103?view=${OPEN.id}&viewSurface=${encodeURIComponent("records:10000000-0000-4000-8000-000000000103")}&viewAction=update`,
+    });
+    expect(focusAgentComposer).toHaveBeenCalledOnce();
+    expect(harness.agent.viewContext.register).toHaveBeenCalledTimes(2);
+  });
+
+  it("attaches the list without a view, without replacing an unrelated composer draft", () => {
+    const host = render(store());
+    harness.agent.composerDraft = "Keep my unfinished request";
+    act(() => host.querySelector<HTMLButtonElement>("#global-data-views-ai")?.click());
+    act(() => harness.menuCloseAutoFocus.current?.(new Event("closeAutoFocus", { cancelable: true })));
+
+    expect(harness.agent.composerDraft).toBe("Keep my unfinished request");
+    expect(harness.agent.openWithContextDraft).toHaveBeenCalledWith(
+      expect.objectContaining({
+        context: expect.objectContaining({
+          label: "AgentChat.context.viewLabel(DataView.views.all,AgentChat.context.surfaceViewTypeStandalone(Deals))",
+          reference: expect.objectContaining({ viewKey: ALL_VIEW_KEY }),
+        }),
+      }),
+    );
+  });
+
+  it("keeps manual view controls available when hosted chat is disabled", () => {
+    harness.agent.enabled = false;
+    const host = render(store());
+    expect(host.querySelector("#global-data-views-ai")).toBeNull();
+    expect(host.querySelector("#global-data-views-new")).not.toBeNull();
+    act(() => host.querySelector<HTMLButtonElement>("#global-data-views-new")?.click());
+    expect(host.querySelector("#view-editor-ai")).toBeNull();
+    expect(host.querySelector("#view-editor-name")).not.toBeNull();
+  });
+
+  it.each([
+    [
+      "",
+      "AgentChat.context.newViewLabel(AgentChat.context.surfaceViewType(Deals))",
+      "AgentChat.context.starter.create",
+    ],
+    [
+      "  Qualified leads  ",
+      "AgentChat.context.namedNewViewLabel(Qualified leads,AgentChat.context.surfaceViewType(Deals))",
+      "AgentChat.context.starter.createNamed(Qualified leads)",
+    ],
+  ])("carries the optional name %j into the attached create-view context", (name, label, draft) => {
+    const value = store({ activeViewKey: OPEN.id });
+    const host = render(value);
+    act(() => host.querySelector<HTMLButtonElement>("#global-data-views-new")?.click());
+    typeInto(host.querySelector<HTMLInputElement>("#view-editor-name"), name);
+    const action = host.querySelector<HTMLButtonElement>("#view-editor-ai");
+    expect(action?.type).toBe("button");
+    expect(action?.disabled).toBe(false);
+    act(() => action?.click());
+    expect(host.querySelector("#view-editor-name")).toBeNull();
+    const closeEvent = new Event("closeAutoFocus", { cancelable: true });
+    act(() => harness.overlayCloseAutoFocus.current?.(closeEvent));
+    expect(closeEvent.defaultPrevented).toBe(true);
+    expect(harness.agent.openWithContextDraft).toHaveBeenCalledExactlyOnceWith({
+      context: {
+        label,
+        reference: {
+          kind: "dataView",
+          ...(name.trim() ? { proposedName: name.trim() } : {}),
+          requestedAction: "create",
+          surfaceKey: "records:10000000-0000-4000-8000-000000000103",
+        },
+      },
+      draft,
+      pageRoute: `/en/records/10000000-0000-4000-8000-000000000103?view=${OPEN.id}&viewSurface=${encodeURIComponent("records:10000000-0000-4000-8000-000000000103")}&viewAction=create`,
+    });
+    expect(focusAgentComposer).toHaveBeenCalledOnce();
+    expect(harness.upsertDataViewAction).not.toHaveBeenCalled();
+    expect(value.applyView).not.toHaveBeenCalled();
+  });
+
+  it.each(["DataView.views.editTitle", "DataView.views.duplicate"])("keeps %s on its existing manual flow", (label) => {
+    const host = render(store({ activeViewKey: OPEN.id }));
+    act(() => byText(host, label).click());
+    expect(host.querySelector("#view-editor-name")).toBeNull();
+    const closed = new Event("closeAutoFocus", { cancelable: true });
+    act(() => harness.menuCloseAutoFocus.current?.(closed));
+    expect(closed.defaultPrevented).toBe(true);
+    expect(host.querySelector("#view-editor-name")).not.toBeNull();
+    expect(host.querySelector("#view-editor-ai")).toBeNull();
+  });
+
+  it("lets an untouched duplicate cancel cleanly or save its preset name", async () => {
+    const host = render(store({ activeViewKey: OPEN.id }));
+    chooseFromMenu(host, "DataView.views.duplicate");
+    expect(host.querySelector('[data-slot="unsaved-changes-bar"]')?.textContent).not.toContain("Common.unsavedChanges");
+    expect(host.querySelector<HTMLButtonElement>("#view-editor-save")?.disabled).toBe(false);
+    act(() => host.querySelector<HTMLButtonElement>("#view-editor-cancel")?.click());
+    expect(host.querySelector("#view-editor-name")).toBeNull();
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(harness.upsertDataViewAction).not.toHaveBeenCalled();
+
+    chooseFromMenu(host, "DataView.views.duplicate");
+    await submitMetaForm(host);
+    expect(harness.upsertDataViewAction).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ name: "DataView.views.duplicateName(Open deals)" }),
+    );
+    expect(host.querySelector("#view-editor-name")).toBeNull();
+  });
+
+  it("asks about the saved view while editing without applying an unfinished rename", () => {
+    const value = store({ activeViewKey: OPEN.id });
+    const host = render(value);
+    chooseFromMenu(host, "DataView.views.editTitle");
+    typeInto(host.querySelector<HTMLInputElement>("#view-editor-name"), "Unfinished name");
+    act(() => host.querySelector<HTMLButtonElement>("#view-editor-ask-ai")?.click());
+    expect(host.querySelector("#view-editor-name")).toBeNull();
+    const event = new Event("closeAutoFocus", { cancelable: true });
+    act(() => harness.overlayCloseAutoFocus.current?.(event));
+    expect(event.defaultPrevented).toBe(true);
+    expect(harness.agent.openWithContextDraft).toHaveBeenCalledWith(
+      expect.objectContaining({
+        context: expect.objectContaining({
+          label: "AgentChat.context.viewLabel(Open deals,AgentChat.context.surfaceViewTypeStandalone(Deals))",
+          reference: expect.objectContaining({ viewKey: OPEN.id }),
+        }),
+      }),
+    );
+    expect(harness.agent.openWithContextDraft).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        context: expect.objectContaining({ label: expect.stringContaining("Unfinished name") }),
+      }),
+    );
+    expect(harness.upsertDataViewAction).not.toHaveBeenCalled();
+  });
+
+  it("keeps normal cancellation focus return and does not open chat", () => {
+    const host = render(store());
+    act(() => host.querySelector<HTMLButtonElement>("#global-data-views-new")?.click());
+    act(() => byText(host, "Common.actions.cancel").click());
+    const event = new Event("closeAutoFocus", { cancelable: true });
+    act(() => harness.overlayCloseAutoFocus.current?.(event));
+    expect(event.defaultPrevented).toBe(false);
+    expect(harness.agent.openWithDraft).not.toHaveBeenCalled();
+    expect(harness.agent.openWithContextDraft).not.toHaveBeenCalled();
+  });
+
+  it("moves focus across the tabs with the arrow keys and keeps one tab stop", () => {
+    const host = render(store({ activeViewKey: "v-b" }));
+    const links = chips(host);
+
+    expect(links).toHaveLength(4);
+    expect(host.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+    expect(links[2].getAttribute("tabindex")).toBe("0");
+
+    links[2].focus();
+    press(links[2], "ArrowRight");
+    expect(document.activeElement).toBe(links[3]);
+
+    press(links[3], "ArrowLeft");
+    expect(document.activeElement).toBe(links[2]);
+
+    press(links[2], "End");
+    expect(document.activeElement).toBe(links[3]);
+
+    press(links[3], "Home");
+    expect(document.activeElement).toBe(links[0]);
+    expect(links[0].id).toBe("global-data-views-all");
+
+    press(links[0], "ArrowLeft");
+    expect(document.activeElement).toBe(links[0]);
+    expect(host.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+  });
+
+  it("puts the All tab first and keeps it as the tab stop while it is active", () => {
+    const host = render(store());
+    const links = chips(host);
+
+    expect(links.map((link) => link.textContent)).toEqual(["DataView.views.all", "Ada", "Open deals", "Closing"]);
+    expect(host.querySelector("#global-data-views-all")).toBe(links[0]);
+    expect(host.querySelector('[aria-current="page"]')).toBe(links[0]);
+    expect(links[0].getAttribute("href")).toBe("/en/records/10000000-0000-4000-8000-000000000103");
+    expect(links.map((link) => link.getAttribute("tabindex"))).toEqual(["0", "-1", "-1", "-1"]);
+  });
+
+  it("applies a view on a plain click and pushes the url afterwards, and defers to the browser otherwise", () => {
+    const value = store();
+    const host = render(value);
+    const pushState = vi.spyOn(window.history, "pushState");
+    const target = chips(host)[1];
+
+    act(() => target.click());
+
+    expect(value.applyView).toHaveBeenCalledExactlyOnceWith("v-a");
+    expect(harness.menuOpen).toBe(false);
+    expect(pushState).toHaveBeenCalledExactlyOnceWith(
+      null,
+      "",
+      "/en/records/10000000-0000-4000-8000-000000000103?view=v-a",
+    );
+    expect(harness.calls).toEqual(["applyView"]);
+
+    const modified = new MouseEvent("click", { bubbles: true, cancelable: true, metaKey: true });
+    act(() => {
+      target.dispatchEvent(modified);
+    });
+
+    expect(value.applyView).toHaveBeenCalledOnce();
+    expect(pushState).toHaveBeenCalledOnce();
+  });
+
+  it("closes an open detail by routing, and routes without the locale the router adds back", () => {
+    harness.searchParams.current = "threadId=t-1";
+    const value = store();
+    const host = render(value, "threadId");
+    const pushState = vi.spyOn(window.history, "pushState");
+
+    act(() => chips(host)[1].click());
+
+    expect(harness.routerPush).toHaveBeenCalledExactlyOnceWith(
+      "/records/10000000-0000-4000-8000-000000000103?view=v-a",
+    );
+    expect(value.applyView).not.toHaveBeenCalled();
+    expect(pushState).not.toHaveBeenCalled();
+  });
+
+  it("selects in place when no detail is open", () => {
+    harness.searchParams.current = "";
+    const value = store();
+    const host = render(value, "threadId");
+
+    act(() => chips(host)[1].click());
+
+    expect(harness.routerPush).not.toHaveBeenCalled();
+    expect(value.applyView).toHaveBeenCalledExactlyOnceWith("v-a");
+  });
+
+  it("does nothing when the active tab is selected again, and returns to All only through its tab", () => {
+    const value = store({ activeViewKey: OPEN.id });
+    const host = render(value);
+    const pushState = vi.spyOn(window.history, "pushState");
+    const active = chips(host)[2];
+
+    expect(active.getAttribute("aria-current")).toBe("page");
+    expect(active.getAttribute("href")).toBe(`/en/records/10000000-0000-4000-8000-000000000103?view=${OPEN.id}`);
+
+    act(() => {
+      active.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, ctrlKey: true }));
+    });
+    act(() => active.click());
+    expect(value.applyView).not.toHaveBeenCalled();
+    expect(pushState).not.toHaveBeenCalled();
+
+    act(() => chips(host)[0].click());
+
+    expect(value.applyView).toHaveBeenCalledExactlyOnceWith(ALL_VIEW_KEY);
+    expect(pushState).toHaveBeenCalledExactlyOnceWith(null, "", "/en/records/10000000-0000-4000-8000-000000000103");
+  });
+
+  it("does nothing when the active All tab is selected again", () => {
+    const value = store();
+    const host = render(value);
+
+    act(() => chips(host)[0].click());
+
+    expect(value.applyView).not.toHaveBeenCalled();
+  });
+
+  it("closes an open detail onto the active view instead of leaving it", () => {
+    harness.searchParams.current = "threadId=t-1";
+    const value = store({ activeViewKey: OPEN.id });
+    const host = render(value, "threadId");
+
+    act(() => chips(host)[2].click());
+
+    expect(harness.routerPush).toHaveBeenCalledExactlyOnceWith(
+      `/records/10000000-0000-4000-8000-000000000103?view=${OPEN.id}`,
+    );
+    expect(value.applyView).not.toHaveBeenCalled();
+  });
+
+  it("selects a tab that only looks inactive behind a proposed new view instead of leaving it", () => {
+    const value = store({
+      activeViewKey: OPEN.id,
+      isViewModified: true,
+      proposal: { isNew: true, name: "Assigned to me" },
+    } as unknown as Partial<BaseDataViewStore<Item>>);
+    const host = render(value);
+
+    expect(host.querySelector("#global-data-views-proposed")?.textContent).toContain("Assigned to me");
+    expect(chips(host)[2].getAttribute("aria-current")).toBeNull();
+    expect(chips(host)[0].getAttribute("aria-current")).toBeNull();
+
+    act(() => chips(host)[2].click());
+
+    expect(value.applyView).toHaveBeenCalledExactlyOnceWith(OPEN.id);
+  });
+
+  it("keeps a proposed new view open when its own tab is clicked", () => {
+    const value = store({
+      activeViewKey: ALL_VIEW_KEY,
+      isViewModified: true,
+      proposal: { isNew: true, name: "Cursor bookings" },
+    } as unknown as Partial<BaseDataViewStore<Item>>);
+    const host = render(value);
+    let leftPage: boolean | undefined;
+    host.addEventListener("click", (event) => (leftPage = !event.defaultPrevented));
+
+    act(() => host.querySelector<HTMLAnchorElement>("#global-data-views-proposed")?.click());
+
+    expect(leftPage).toBe(false);
+    expect(value.applyView).not.toHaveBeenCalled();
+    expect(harness.routerPush).not.toHaveBeenCalled();
+  });
+
+  it("offers Switch view only once views exist, lists All first and ignores choosing the active view again", () => {
+    const empty = store({ views: [] });
+    render(empty);
+    act(() => root?.render(createElement(DataViewViewsRail<Item>, { joinsTopBar: true, store: empty })));
+    expect(harness.viewPicker.register).not.toHaveBeenCalled();
+
+    const value = store({ activeViewKey: OPEN.id });
+    act(() => root?.render(createElement(DataViewViewsRail<Item>, { joinsTopBar: true, store: value })));
+    expect(harness.viewPicker.register).toHaveBeenCalledOnce();
+    expect(harness.viewPicker.surface?.options().map((option) => option.id)).toEqual([
+      ALL_VIEW_KEY,
+      ADA.id,
+      OPEN.id,
+      CLOSING.id,
+    ]);
+    expect(harness.viewPicker.surface?.options()[0]).toEqual({ id: ALL_VIEW_KEY, name: "DataView.views.all" });
+
+    act(() => harness.viewPicker.surface?.select(OPEN.id));
+    expect(value.applyView).not.toHaveBeenCalled();
+    act(() => harness.viewPicker.surface?.select(ALL_VIEW_KEY));
+    expect(value.applyView).toHaveBeenLastCalledWith(ALL_VIEW_KEY);
+    act(() => harness.viewPicker.surface?.select(ADA.id));
+    expect(value.applyView).toHaveBeenLastCalledWith(ADA.id);
+
+    act(() => root?.render(createElement(DataViewViewsRail<Item>, { joinsTopBar: true, store: empty })));
+    expect(harness.viewPicker.surface).toBeNull();
+  });
+
+  it("shows a draft tab while creating, then saves the current query as a view and activates it", async () => {
+    const value = store({ filters: [{ field: "stage", operator: "in", value: ["open"] }] } as unknown as Partial<
+      BaseDataViewStore<Item>
+    >);
+    const host = render(value);
+    const pushState = vi.spyOn(window.history, "pushState");
+
+    expect(host.querySelector("[data-view-draft]")).toBeNull();
+    expect(host.querySelector("#global-data-views-new")).not.toBeNull();
+
+    act(() => host.querySelector<HTMLButtonElement>("#global-data-views-new")?.click());
+
+    const draft = host.querySelector<HTMLElement>("[data-view-draft]");
+    expect(draft).toBe(host.querySelector("#global-data-views-new"));
+    expect(host.querySelectorAll("[data-view-draft]")).toHaveLength(1);
+    expect(draft?.textContent).toBe("DataView.views.createTitle");
+    expect(draft?.className).toContain("border-dashed");
+    expect(draft?.className).toContain("border-input");
+    expect(draft?.className).not.toContain("border-border");
+    expect(draft?.className).toContain("h-7");
+    expect(draft?.className).toContain("rounded-full");
+    expect(draft?.className).toContain("px-2.5");
+    expect(draft?.className).toContain("bg-transparent");
+    expect(draft?.className).not.toContain("bg-secondary");
+    expect(draft?.className).toContain("shadow-none");
+    expect(draft?.className).not.toContain("rounded-md");
+    expect(chips(host)).toHaveLength(4);
+
+    const input = host.querySelector<HTMLInputElement>("#view-editor-name");
+    expect(input).not.toBeNull();
+    typeInto(input, "Hot leads");
+    expect(host.querySelector("[data-view-draft]")?.textContent).toBe("DataView.views.createTitle");
+
+    await submitMetaForm(host);
+
+    expect(harness.upsertDataViewAction).toHaveBeenCalledExactlyOnceWith({
+      name: "Hot leads",
+      state: {
+        columnOrder: [],
+        columnWidths: {},
+        filters: [{ field: "stage", operator: "in", value: ["open"] }],
+        grouping: null,
+        hiddenColumns: [],
+        pageSize: 25,
+        searchTerm: "",
+        sortDescriptor: null,
+        viewMode: "table",
+      },
+      surfaceKey: "records:10000000-0000-4000-8000-000000000103",
+    });
+    expect(harness.calls).toEqual(["upsertDataViewAction", "refresh", "applyView"]);
+    expect(value.applyView).toHaveBeenCalledExactlyOnceWith("v-new");
+    expect(pushState).toHaveBeenCalledExactlyOnceWith(
+      null,
+      "",
+      "/en/records/10000000-0000-4000-8000-000000000103?view=v-new",
+    );
+    expect(host.querySelector("[data-view-draft]")).toBeNull();
+  });
+
+  it("keeps the create overlay open when the write is refused", async () => {
+    harness.upsertDataViewAction.mockResolvedValue({ error: { errors: ["nope"] }, ok: false });
+    const value = store();
+    const host = render(value);
+
+    act(() => host.querySelector<HTMLButtonElement>("#global-data-views-new")?.click());
+    typeInto(host.querySelector<HTMLInputElement>("#view-editor-name"), "Hot leads");
+    await submitMetaForm(host);
+
+    expect(harness.upsertDataViewAction).toHaveBeenCalledOnce();
+    expect(value.applyView).not.toHaveBeenCalled();
+    expect(host.querySelector("#view-editor-name")).not.toBeNull();
+    expect(host.querySelector("[data-view-draft]")).not.toBeNull();
+  });
+
+  it("offers Ask AI followed by the existing active-view actions", () => {
+    const host = render(store({ activeViewKey: "v-b" }));
+
+    expect(menuLabels(host)).toEqual([
+      "DataView.views.askAi",
+      "DataView.views.editTitle",
+      "DataView.views.duplicate",
+      "DataView.views.moveLeft",
+      "DataView.views.moveRight",
+      "DataView.views.copyLink",
+      "DataView.views.delete",
+    ]);
+    expect(host.querySelector("[data-view-menu]")?.textContent).not.toContain("Common.actions.save");
+  });
+
+  it("marks only the active chip as modified and offers Save and Reset changes after Ask AI", () => {
+    const value = store({ activeViewKey: "v-b", isViewModified: true } as Partial<BaseDataViewStore<Item>>);
+    const host = render(value);
+
+    const modified = host.querySelectorAll("[data-view-modified]");
+    expect(modified).toHaveLength(1);
+    expect(modified[0]?.textContent).toContain("Open deals");
+    expect(modified[0]?.textContent).toContain("DataView.views.modified");
+    expect(menuLabels(host).slice(0, 3)).toEqual([
+      "DataView.views.askAi",
+      "Common.actions.save",
+      "DataView.views.resetChanges",
+    ]);
+
+    act(() => byText(host, "Common.actions.save").click());
+    expect(value.saveViewChanges).toHaveBeenCalledOnce();
+
+    act(() => byText(host, "DataView.views.resetChanges").click());
+    expect(value.resetViewChanges).toHaveBeenCalledOnce();
+  });
+
+  it("shows no modified dot and no reset entry while the view is clean", () => {
+    const host = render(store({ activeViewKey: "v-b" }));
+
+    expect(host.querySelector("[data-view-modified]")).toBeNull();
+    expect(menuLabels(host)).not.toContain("DataView.views.resetChanges");
+    expect(menuLabels(host)).not.toContain("Common.actions.save");
+  });
+
+  it("offers Ask AI and the All tab's Copy link while All is clean", () => {
+    const host = render(store());
+
+    expect(menuLabels(host)).toEqual(["DataView.views.askAi", "DataView.views.copyLink"]);
+    expect(host.querySelector("#global-data-views-menu")?.hasAttribute("data-view-modified")).toBe(false);
+    expect(host.querySelector("[data-view-menu] hr")).toBeNull();
+  });
+
+  it("marks the All tab while its layout has unsaved changes and offers Save and Reset changes", () => {
+    const value = store({ isViewModified: true } as Partial<BaseDataViewStore<Item>>);
+    const host = render(value);
+    const menu = host.querySelector<HTMLButtonElement>("#global-data-views-menu");
+
+    expect(menu?.hasAttribute("data-view-modified")).toBe(false);
+    expect(menu?.hasAttribute("aria-describedby")).toBe(false);
+    expect(host.querySelectorAll("[data-view-modified]")).toHaveLength(1);
+    expect(host.querySelector("#global-data-views-all")?.hasAttribute("data-view-modified")).toBe(true);
+    expect(host.querySelector("#global-data-views-all")?.textContent).toContain("DataView.views.modified");
+    expect(menuLabels(host)).toEqual([
+      "DataView.views.askAi",
+      "Common.actions.save",
+      "DataView.views.resetChanges",
+      "DataView.views.copyLink",
+    ]);
+    expect(host.querySelector("[data-view-menu] hr")).not.toBeNull();
+
+    act(() => byText(host, "Common.actions.save").click());
+    expect(value.saveViewChanges).toHaveBeenCalledOnce();
+
+    act(() => byText(host, "DataView.views.resetChanges").click());
+    expect(value.resetViewChanges).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the view menu for the All tab's link when hosted chat is disabled", () => {
+    harness.agent.enabled = false;
+    const host = render(store());
+
+    expect(host.querySelector("#global-data-views-menu")).not.toBeNull();
+    expect(menuLabels(host)).toEqual(["DataView.views.copyLink"]);
+    expect(host.querySelector("#global-data-views-new")).not.toBeNull();
+    expect(chips(host)).toHaveLength(4);
+  });
+
+  it("offers Save as view instead of Save while All has filters, naming the view after them", async () => {
+    const filters = [
+      { field: "provider", operator: "in", value: ["cursor"] },
+      { field: "status", operator: "equals", value: "open" },
+    ];
+    const value = store({
+      canSaveAsView: true,
+      canSaveViewChanges: false,
+      filterColumns: [
+        { id: "provider", label: "Provider" },
+        { id: "status", label: "Status" },
+      ],
+      filters,
+      isViewModified: true,
+      searchTerm: "acme",
+    } as unknown as Partial<BaseDataViewStore<Item>>);
+    const host = render(value);
+
+    expect(menuLabels(host)).toEqual([
+      "DataView.views.askAi",
+      "DataView.views.saveAsView",
+      "DataView.views.resetChanges",
+      "DataView.views.copyLink",
+    ]);
+    expect(host.querySelector("#global-data-views-all")?.hasAttribute("data-view-modified")).toBe(true);
+
+    const closed = chooseFromMenu(host, "DataView.views.saveAsView");
+    expect(closed.defaultPrevented).toBe(true);
+    expect(host.querySelector<HTMLInputElement>("#view-editor-name")?.value).toBe(
+      'Provider: Cursor · Status: Open · "acme"',
+    );
+
+    await submitMetaForm(host);
+
+    expect(harness.upsertDataViewAction).toHaveBeenCalledExactlyOnceWith({
+      name: 'Provider: Cursor · Status: Open · "acme"',
+      state: expect.objectContaining({ filters, searchTerm: "acme" }),
+      surfaceKey: "records:10000000-0000-4000-8000-000000000103",
+    });
+    expect(value.forgetQueryDraft).toHaveBeenCalledWith(ALL_VIEW_KEY);
+    expect(harness.calls).toEqual(["upsertDataViewAction", "refresh", "applyView"]);
+    expect(value.applyView).toHaveBeenCalledExactlyOnceWith("v-new");
+  });
+
+  it("registers Save as view for the filter and display bars and falls back to My filters without a readable filter", () => {
+    const value = store({ canSaveAsView: true, filters: [], isViewModified: true } as unknown as Partial<
+      BaseDataViewStore<Item>
+    >);
+    const host = render(value);
+
+    expect(value.registerSaveAsView).toHaveBeenCalled();
+    act(() => value.openSaveAsView());
+
+    expect(host.querySelector<HTMLInputElement>("#view-editor-name")?.value).toBe("DataView.views.myFilters");
+  });
+
+  it("opens the overlay only once the menu has closed, so the closing menu cannot dismiss it, and focuses the name", () => {
+    const host = render(store({ activeViewKey: OPEN.id }));
+
+    act(() => byText(host, "DataView.views.duplicate").click());
+
+    expect(host.querySelector("#view-editor-name"), "the editor waits until the menu has closed").toBeNull();
+    const close = harness.menuCloseAutoFocus.current;
+    expect(
+      close,
+      "the menu must hand off its close focus, or Radix returns focus to the trigger and dismisses the overlay",
+    ).toBeTypeOf("function");
+
+    const event = new Event("closeAutoFocus", { cancelable: true });
+    act(() => close?.(event));
+
+    expect(event.defaultPrevented).toBe(true);
+    const input = host.querySelector<HTMLInputElement>("#view-editor-name");
+    expect(input).not.toBeNull();
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("preserves primitive focus handling when there is no intentional overlay handoff", () => {
+    const host = render(store({ activeViewKey: "v-b" }));
+    const outsideControl = host.querySelector<HTMLButtonElement>("#global-data-views-new");
+    outsideControl?.focus();
+
+    const close = harness.menuCloseAutoFocus.current;
+    const event = new Event("closeAutoFocus", { cancelable: true });
+    act(() => close?.(event));
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(document.activeElement).toBe(outsideControl);
+  });
+
+  it("renames the active view through the edit overlay with the store's live state", async () => {
+    const value = store({ activeViewKey: "v-c" });
+    const host = render(value);
+
+    chooseFromMenu(host, "DataView.views.editTitle");
+
+    const input = host.querySelector<HTMLInputElement>("#view-editor-name");
+    expect(input?.value).toBe("Closing");
+    expect(host.querySelector("[data-view-draft]")).toBeNull();
+
+    typeInto(input, "Closed");
+    await submitMetaForm(host);
+
+    expect(harness.upsertDataViewAction).toHaveBeenCalledExactlyOnceWith({
+      id: "v-c",
+      name: "Closed",
+      position: undefined,
+      state: {
+        columnOrder: [],
+        columnWidths: {},
+        filters: [],
+        grouping: null,
+        hiddenColumns: [],
+        pageSize: 25,
+        searchTerm: "",
+        sortDescriptor: null,
+        viewMode: "table",
+      },
+      surfaceKey: "records:10000000-0000-4000-8000-000000000103",
+    });
+    expect(harness.calls).toEqual(["upsertDataViewAction", "refresh"]);
+    expect(host.querySelector("#view-editor-name")).toBeNull();
+  });
+
+  it("keeps the saved query when renaming a view whose filters are only modified", async () => {
+    const saved = view({
+      id: "v-d",
+      name: "Won",
+      position: 3,
+      state: {
+        filters: [{ field: "stage", operator: "in", value: ["won"] }],
+        searchTerm: "acme",
+      } as unknown as DataViewState,
+    });
+    const value = store({
+      activeViewKey: "v-d",
+      filters: [{ field: "stage", operator: "in", value: ["lost"] }],
+      isViewModified: true,
+      searchTerm: "temporary",
+      views: [...VIEWS, saved],
+    } as unknown as Partial<BaseDataViewStore<Item>>);
+    const host = render(value);
+
+    chooseFromMenu(host, "DataView.views.editTitle");
+    typeInto(host.querySelector<HTMLInputElement>("#view-editor-name"), "Won deals");
+    await submitMetaForm(host);
+
+    expect(harness.upsertDataViewAction.mock.calls[0]?.[0]?.state).toMatchObject({
+      filters: [{ field: "stage", operator: "in", value: ["won"] }],
+      searchTerm: "acme",
+    });
+  });
+
+  it("deletes through the shared confirmation, falls back to no view and returns focus to New view", async () => {
+    const value = store({ activeViewKey: "v-a" });
+    const host = render(value);
+
+    await act(async () => {
+      byText(host, "DataView.views.delete").click();
+      await Promise.resolve();
+    });
+
+    expect(harness.deleteDataViewAction).not.toHaveBeenCalled();
+    expect(harness.confirmations).toHaveLength(1);
+    expect(harness.confirmations[0].entityName).toBe("Ada");
+
+    await act(async () => {
+      expect(await harness.confirmations[0].onConfirm()).toEqual({ trashBatchId: TRASH_BATCH_ID });
+    });
+
+    expect(harness.deleteDataViewAction).toHaveBeenCalledExactlyOnceWith({ id: "v-a" });
+    expect(value.applyView).toHaveBeenCalledExactlyOnceWith(ALL_VIEW_KEY);
+    expect(value.refresh).not.toHaveBeenCalled();
+    const create = host.querySelector<HTMLButtonElement>("#global-data-views-new");
+    if (!create) throw new Error("Expected the New view control");
+    vi.spyOn(create, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
+    expect(harness.confirmations[0].focusAfterConfirm?.()).toBe(true);
+    expect(document.activeElement).toBe(create);
+  });
+
+  it.each([true, false])("restores deletion focus only to its usable owning rail (usable=%s)", async (usable) => {
+    const parent = store();
+    const child = store({ activeViewKey: "v-a", p13nId: SURFACE.entityTimeline, viewSyncToUrl: false });
+    const host = render(parent);
+    act(() => {
+      root?.render(
+        createElement(
+          "div",
+          null,
+          createElement(
+            "section",
+            { "data-parent-rail": "" },
+            createElement(DataViewViewsRail<Item>, { store: parent }),
+          ),
+          createElement("section", { "data-child-rail": "" }, createElement(DataViewViewsRail<Item>, { store: child })),
+        ),
+      );
+    });
+    const owningRail = host.querySelector<HTMLElement>("[data-child-rail]");
+    if (!owningRail) throw new Error("Expected mounted child rail");
+    await act(async () => {
+      byText(owningRail, "DataView.views.delete").click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      expect(await harness.confirmations[0].onConfirm()).toEqual({ trashBatchId: TRASH_BATCH_ID });
+    });
+    expect(child.applyView).toHaveBeenCalledExactlyOnceWith(ALL_VIEW_KEY);
+    expect(parent.applyView).not.toHaveBeenCalled();
+    const create = owningRail.querySelector<HTMLButtonElement>("#global-data-views-new");
+    if (!create) throw new Error("Expected the owning New view control");
+    vi.spyOn(create, "getClientRects").mockReturnValue((usable ? [{}] : []) as unknown as DOMRectList);
+    const parentCreate = host.querySelector<HTMLButtonElement>("[data-parent-rail] #global-data-views-new");
+    if (!parentCreate) throw new Error("Expected the visible parent New view control");
+    vi.spyOn(parentCreate, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
+    expect(harness.confirmations[0].focusAfterConfirm?.()).toBe(usable);
+    if (usable) expect(document.activeElement).toBe(create);
+    else expect(document.activeElement).not.toBe(parentCreate);
+  });
+
+  it("does not move deletion focus into a replacement store on the same mounted rail", async () => {
+    const earlier = store({ activeViewKey: "v-a" });
+    const host = render(earlier);
+    let finish!: (result: { ok: boolean; data: { id: string; trashBatchId: string } }) => void;
+    harness.deleteDataViewAction.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    await act(async () => {
+      byText(host, "DataView.views.delete").click();
+      await Promise.resolve();
+    });
+    const pending = harness.confirmations[0].onConfirm();
+    const replacement = store({ p13nId: SURFACE.entityTimeline, viewSyncToUrl: false });
+    act(() => root?.render(createElement(DataViewViewsRail<Item>, { store: replacement })));
+    const create = host.querySelector<HTMLButtonElement>("#global-data-views-new");
+    if (!create) throw new Error("Expected the replacement New view control");
+    vi.spyOn(create, "getClientRects").mockReturnValue([{}] as unknown as DOMRectList);
+    await act(async () => {
+      finish({ ok: true, data: { id: "v-a", trashBatchId: TRASH_BATCH_ID } });
+      expect(await pending).toEqual({ trashBatchId: TRASH_BATCH_ID });
+    });
+    expect(harness.confirmations[0].focusAfterConfirm?.()).toBe(false);
+    expect(document.activeElement).not.toBe(create);
+    expect(replacement.applyView).not.toHaveBeenCalled();
+  });
+
+  it("waits for the delete notice of the chosen view before asking to confirm", async () => {
+    let answer!: (notice: { message: string; details: string[] }) => void;
+    const deleteNotice = vi.fn(
+      () =>
+        new Promise<{ message: string; details: string[] }>((resolve) => {
+          answer = resolve;
+        }),
+    );
+    const host = render(store({ activeViewKey: "v-a" }));
+    act(() => {
+      root?.render(createElement(DataViewViewsRail<Item>, { deleteNotice, store: store({ activeViewKey: "v-a" }) }));
+    });
+
+    await act(async () => {
+      byText(host, "DataView.views.delete").click();
+      await Promise.resolve();
+    });
+
+    expect(deleteNotice).toHaveBeenCalledExactlyOnceWith(ADA);
+    expect(harness.notices).toEqual([]);
+    await act(async () => {
+      answer({ message: "Its widget moves to Trash with it:", details: ["Berlin starter"] });
+      await Promise.resolve();
+    });
+    expect(harness.notices).toEqual([
+      expect.objectContaining({ message: "Its widget moves to Trash with it:", details: ["Berlin starter"] }),
+    ]);
+    expect(harness.confirmations).toEqual([]);
+  });
+
+  it("swaps positions with the neighbouring view when reordering", async () => {
+    const value = store({ activeViewKey: "v-c" });
+    const host = render(value);
+
+    await act(async () => {
+      byText(host, "DataView.views.moveLeft").click();
+      await Promise.resolve();
+    });
+
+    expect(harness.upsertDataViewAction).toHaveBeenCalledTimes(2);
+    expect(harness.upsertDataViewAction.mock.calls[0][0]).toMatchObject({ id: "v-c", position: 1 });
+    expect(harness.upsertDataViewAction.mock.calls[1][0]).toMatchObject({ id: "v-b", position: 2 });
+    expect(byText(host, "DataView.views.moveRight").disabled).toBe(true);
+  });
+});
