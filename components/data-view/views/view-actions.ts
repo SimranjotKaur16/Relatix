@@ -1,0 +1,153 @@
+import type { MovedToTrash } from "@/features/trash/moved-to-trash";
+import type { BaseDataViewStore, HasId } from "@/core/base/base-data-view.store";
+import type { DataViewSurfaceKey } from "@/core/data-view/data-view-keys";
+import type { DataViewChipDto } from "@/core/data-view/data-view-state.schema";
+import type { SharedView } from "@/core/data-view/shared-view-link";
+
+import { toJS } from "mobx";
+
+import { deleteDataViewAction, upsertDataViewAction } from "@/app/actions";
+import { ALL_VIEW_KEY } from "@/core/data-view/data-view-keys";
+import { SHARED_VIEW_PARAM, encodeSharedView } from "@/core/data-view/shared-view-link";
+import { toastZodErrorTree } from "@/core/utils/toast-zod-error-tree";
+
+import { sortViewsByPosition } from "./view-rail-model";
+
+type UpsertResult = Awaited<ReturnType<typeof upsertDataViewAction>>;
+
+export function surfaceKeyOf<E extends HasId>(store: BaseDataViewStore<E>): DataViewSurfaceKey {
+  return store.p13nId as DataViewSurfaceKey;
+}
+
+export function viewHref(pathname: string, viewKey: string, surfaceKey?: DataViewSurfaceKey): string {
+  if (surfaceKey) return `${pathname}?${new URLSearchParams({ view: viewKey, viewSurface: surfaceKey })}`;
+  return viewKey === ALL_VIEW_KEY ? pathname : `${pathname}?view=${encodeURIComponent(viewKey)}`;
+}
+
+export function viewLink(
+  pathname: string,
+  viewKey: string,
+  surfaceKey?: DataViewSurfaceKey,
+  shared?: SharedView,
+): string {
+  const link = new URL(viewHref(pathname, viewKey, surfaceKey), window.location.origin);
+  if (shared) link.searchParams.set(SHARED_VIEW_PARAM, encodeSharedView(shared));
+  return link.toString();
+}
+
+export function sharedViewOf<E extends HasId>(
+  store: BaseDataViewStore<E>,
+  view: DataViewChipDto,
+): SharedView | undefined {
+  if (!store.sharesViewState || !store.p13nId || view.id === ALL_VIEW_KEY) return undefined;
+  return { name: view.name, surfaceKey: surfaceKeyOf(store), state: toJS(view.state) };
+}
+
+export function selectView<E extends HasId>(store: BaseDataViewStore<E>, viewKey: string, pathname: string): void {
+  store.applyView(viewKey);
+  if (store.viewSyncToUrl === false || (store.viewPathname && store.viewPathname !== pathname)) return;
+  window.history.pushState(null, "", viewHref(pathname, viewKey, store.viewPathname ? surfaceKeyOf(store) : undefined));
+}
+
+function unwrap(result: UpsertResult): DataViewChipDto | null {
+  if (result.ok) return result.data;
+
+  toastZodErrorTree(result.error);
+  return null;
+}
+
+export async function createViewFromCurrent<E extends HasId>(
+  store: BaseDataViewStore<E>,
+  args: { name: string },
+): Promise<DataViewChipDto | null> {
+  const state = store.viewStateSnapshot({ includeQuery: true });
+  const created = unwrap(
+    await upsertDataViewAction({
+      name: args.name,
+      state: store.activeViewKey === ALL_VIEW_KEY ? { ...state, searchTerm: store.searchTerm ?? "" } : state,
+      surfaceKey: surfaceKeyOf(store),
+    }),
+  );
+  if (!created) return null;
+
+  store.forgetQueryDraft(store.activeViewKey);
+
+  await store.refresh();
+  return created;
+}
+
+export async function duplicateView<E extends HasId>(
+  store: BaseDataViewStore<E>,
+  source: DataViewChipDto,
+  args: { name: string },
+): Promise<DataViewChipDto | null> {
+  const copy = unwrap(
+    await upsertDataViewAction({
+      name: args.name,
+      state: toJS(source.state),
+      surfaceKey: surfaceKeyOf(store),
+    }),
+  );
+  if (!copy) return null;
+
+  await store.refresh();
+  return copy;
+}
+
+export async function updateViewMeta<E extends HasId>(
+  store: BaseDataViewStore<E>,
+  view: DataViewChipDto,
+  changes: { name?: string; position?: number },
+): Promise<boolean> {
+  const updated = unwrap(
+    await upsertDataViewAction({
+      id: view.id,
+      name: changes.name ?? view.name,
+      position: changes.position,
+      state: view.id === store.activeViewKey ? store.viewStateSnapshot({ includeQuery: false }) : toJS(view.state),
+      surfaceKey: surfaceKeyOf(store),
+    }),
+  );
+
+  return Boolean(updated);
+}
+
+export async function moveView<E extends HasId>(
+  store: BaseDataViewStore<E>,
+  view: DataViewChipDto,
+  offset: -1 | 1,
+): Promise<boolean> {
+  const ordered = sortViewsByPosition(store.views);
+  const neighbour = ordered[ordered.findIndex((candidate) => candidate.id === view.id) + offset];
+  if (!neighbour) return false;
+
+  if (!(await updateViewMeta(store, view, { position: neighbour.position }))) return false;
+  if (!(await updateViewMeta(store, neighbour, { position: view.position }))) return false;
+
+  await store.refresh();
+  return true;
+}
+
+export async function deleteView<E extends HasId>(
+  store: BaseDataViewStore<E>,
+  view: DataViewChipDto,
+): Promise<boolean | MovedToTrash> {
+  const isActive = store.activeViewKey === view.id;
+  if (isActive) store.discardPendingViewState();
+
+  const result = await deleteDataViewAction({ id: view.id });
+  if (!result.ok) {
+    toastZodErrorTree(result.error);
+    return false;
+  }
+
+  store.forgetQueryDraft(view.id);
+
+  if (isActive && store.activeViewKey === view.id) {
+    store.applyView(ALL_VIEW_KEY);
+    if (store.viewPathname && store.viewSyncToUrl && window.location.pathname === store.viewPathname)
+      window.history.replaceState(null, "", viewHref(store.viewPathname, ALL_VIEW_KEY, surfaceKeyOf(store)));
+  } else await store.refresh();
+
+  return { trashBatchId: result.data.trashBatchId };
+}
