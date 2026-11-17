@@ -1,0 +1,404 @@
+import type { ReactNode } from "react";
+import type { BaseDataViewStore } from "@/core/base/base-data-view.store";
+import type * as SegmentedControlModule from "@/components/ui/segmented-control";
+
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it, vi } from "vitest";
+
+import { ALL_VIEW_KEY } from "@/core/data-view/data-view-keys";
+import { ViewMode } from "@/core/base/base-query-builder";
+
+const harness = vi.hoisted(() => ({
+  onLayoutChange: undefined as ((value: string) => void) | undefined,
+  onGroupingChange: undefined as ((value: string) => void) | undefined,
+}));
+
+vi.mock("@/components/ui/segmented-control", async (importOriginal) => {
+  const actual = await importOriginal<typeof SegmentedControlModule>();
+
+  return {
+    ...actual,
+    SegmentedControl: (props: Parameters<typeof actual.SegmentedControl>[0]) => {
+      harness.onLayoutChange = props.onValueChange;
+      return createElement(actual.SegmentedControl, props);
+    },
+  };
+});
+vi.mock("mobx-react-lite", () => ({ observer: <T>(component: T) => component }));
+vi.mock("next-intl", () => ({ useTranslations: () => (key: string) => key }));
+vi.mock("next/navigation", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  usePathname: () => "/en/deals",
+}));
+vi.mock("@/core/stores/root-store.provider", () => ({
+  useRootStore: () => ({ recordWorkspaceStore: { navigation: null } }),
+}));
+vi.mock("@/components/data-view/use-column-label", () => ({ useColumnLabel: () => (uid: string) => uid }));
+vi.mock("@/components/data-view/use-filter-field-label", () => ({
+  useFilterFieldLabel: () => (field: string) =>
+    field === "organizationIds" ? "Account" : `Common.filters.fields.${field}`,
+}));
+vi.mock("@/components/modal", () => ({
+  ResponsiveOverlay: ({ children, title, trigger }: { children: ReactNode; title: ReactNode; trigger: ReactNode }) =>
+    createElement("div", null, trigger, createElement("h2", { "data-slot": "overlay-title" }, title), children),
+}));
+vi.mock("@/components/ui/select", () => ({
+  Select: ({
+    children,
+    value,
+    onValueChange,
+  }: {
+    children: ReactNode;
+    value?: string;
+    onValueChange?: (value: string) => void;
+  }) => {
+    if (value === "stage" || value === "owner") harness.onGroupingChange = onValueChange;
+    return createElement("div", { "data-slot": "select" }, children);
+  },
+  SelectContent: ({ children }: { children: ReactNode }) => createElement("div", null, children),
+  SelectItem: ({ children, value }: { children: ReactNode; value: string }) =>
+    createElement("div", { "data-value": value }, children),
+  SelectTrigger: ({ children, "aria-label": label }: { children: ReactNode; "aria-label"?: string }) =>
+    createElement("div", { "aria-label": label, role: "combobox" }, children),
+  SelectValue: () => null,
+}));
+
+import { DataViewDisplayOptions } from "../display-options";
+import { nextGroupSummary } from "../group-summary-options";
+
+type Item = { id: string };
+
+function store(overrides: Partial<BaseDataViewStore<Item>> = {}): BaseDataViewStore<Item> {
+  return {
+    activeViewKey: ALL_VIEW_KEY,
+    canBoard: true,
+    supportsBoard: true,
+    primaryColumnId: "name",
+    columnsDefinition: [],
+    currentGroupableFieldId: "",
+    customColumns: [],
+    groupableFields: [],
+    grouping: undefined,
+    hiddenColumns: [],
+    orderedColumns: [],
+    sortDescriptor: undefined,
+    summaryFields: [],
+    viewMode: ViewMode.table,
+    views: [],
+    ...overrides,
+  } as unknown as BaseDataViewStore<Item>;
+}
+
+function render(value: BaseDataViewStore<Item>, anchorScope?: string): string {
+  return renderToStaticMarkup(
+    createElement(DataViewDisplayOptions<Item>, { anchorScope, store: value } as {
+      anchorScope?: string;
+      store: BaseDataViewStore<Item>;
+    }) as ReactNode,
+  );
+}
+
+const STAGE = {
+  id: "stage",
+  grouping: { field: "stage" },
+  kind: "customSingleSelect",
+  label: "Stage",
+  supportsDragWriteBack: true,
+} as const;
+
+const DOT = 'class="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-primary"';
+
+describe("display options", () => {
+  it("leaves the trigger unmarked and offers no reset or save on a fresh list", () => {
+    const html = render(store());
+
+    expect(html).not.toContain(DOT);
+    expect(html).not.toContain("Common.actions.reset");
+    expect(html).not.toContain("Common.actions.save");
+  });
+
+  it("lights the dot on the sort, grouping and hidden-column signals", () => {
+    const sorted = render(store({ sortDescriptor: { direction: "asc", field: "name" } }));
+    const hidden = render(store({ hiddenColumns: ["email"] }));
+    const grouped = render(store({ grouping: { field: "userIds" } }));
+
+    expect(sorted).toContain(DOT);
+    expect(hidden).toContain(DOT);
+    expect(grouped).toContain(DOT);
+  });
+
+  it("offers the group-by control in table mode and labels every groupable kind", () => {
+    const html = render(
+      store({
+        groupableFields: [
+          {
+            id: "stage",
+            grouping: { field: "stage" },
+            kind: "customSingleSelect",
+            label: "Stage",
+            supportsDragWriteBack: true,
+          },
+          {
+            id: "userIds",
+            grouping: { field: "userIds" },
+            kind: "relation",
+            labelKey: "Common.filters.fields.userIds",
+            supportsDragWriteBack: false,
+          },
+          {
+            id: "organizationIds",
+            grouping: { field: "organizationIds" },
+            kind: "relation",
+            labelKey: "Common.filters.fields.organizationIds",
+            supportsDragWriteBack: false,
+          },
+          {
+            id: "createdAt:month",
+            grouping: { field: "createdAt", bucket: "month" },
+            kind: "dateBucket",
+            labelKey: "Common.filters.fields.createdAt",
+            bucket: "month",
+            supportsDragWriteBack: false,
+          },
+        ],
+        viewMode: ViewMode.table,
+      }),
+    );
+
+    expect(html).toContain("Common.table.groupBy");
+    expect(html).toContain("Stage");
+    expect(html).toContain("Common.filters.fields.userIds");
+    expect(html).toContain("Account");
+    expect(html).not.toContain("Common.filters.fields.organizationIds");
+    expect(html).toContain("Common.filters.fields.createdAt \u00b7 Common.dateBuckets.month");
+  });
+
+  it("orders the sections layout, group by, sort by, fields and draws no rule between them", () => {
+    const html = render(
+      store({
+        columnsDefinition: [{ uid: "name", label: "Name", sortable: true }],
+        groupableFields: [STAGE],
+        orderedColumns: [{ uid: "name", label: "Name" }],
+      }),
+    );
+
+    const layout = html.indexOf("Common.table.layout");
+    const groupBy = html.indexOf("Common.table.groupBy");
+    const sortBy = html.indexOf("Common.sort.field");
+    const fields = html.indexOf("Common.table.fields");
+
+    expect(Math.min(layout, groupBy, sortBy, fields)).toBeGreaterThan(-1);
+    expect(layout).toBeLessThan(groupBy);
+    expect(groupBy).toBeLessThan(sortBy);
+    expect(sortBy).toBeLessThan(fields);
+    expect(html).not.toContain('data-slot="separator"');
+  });
+
+  it("heads the fields section with a label the overlay title never repeats", () => {
+    const html = render(
+      store({
+        columnsDefinition: [{ uid: "name", label: "Name", sortable: true }],
+        groupableFields: [STAGE],
+        orderedColumns: [{ uid: "name", label: "Name" }],
+      }),
+    );
+
+    const title = /<h2 data-slot="overlay-title">([^<]+)<\/h2>/.exec(html)?.[1] ?? "";
+    const sectionLabels = [...html.matchAll(/uppercase[^>]*>([^<]+)</g)].map((match) => match[1]);
+
+    expect(title).toBe("Common.ariaLabels.tooltipFields");
+    expect(sectionLabels).toEqual([
+      "Common.table.layout",
+      "Common.table.groupBy",
+      "Common.sort.field",
+      "Common.table.fields",
+    ]);
+    expect(sectionLabels).not.toContain(title);
+  });
+
+  it("hides the group-by control on a surface that declares no groupable field", () => {
+    expect(render(store({ viewMode: ViewMode.table }))).not.toContain("Common.table.groupBy");
+  });
+
+  it("renders exactly the table and board layout controls as a segmented list under the anchor scope", () => {
+    const html = render(store(), "deals");
+
+    expect(html).toContain('data-slot="segmented-control"');
+    expect(html).toContain('id="deals-layout-table"');
+    expect(html).toContain('id="deals-layout-board"');
+    expect(html).not.toContain("deals-layout-cards");
+    expect(html).not.toContain("deals-layout-kanban");
+    expect(html).not.toContain("bg-primary data-[state=active]");
+    expect(html).not.toContain('disabled=""');
+  });
+
+  it("labels each layout segment and explains a disabled board", () => {
+    expect(render(store(), "deals")).toContain("Common.table.layouts.board");
+    expect(render(store({ canBoard: false }), "deals")).toContain("Common.ariaLabels.switchToBoardViewDisabled");
+  });
+
+  it("names the layout tab list and both pickers and points no layout tab at a panel that is never rendered", () => {
+    const html = render(
+      store({
+        columnsDefinition: [{ uid: "name", label: "Name", sortable: true }],
+        groupableFields: [STAGE],
+      }),
+      "deals",
+    );
+    const ids = new Set([...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]));
+    const controls = [...html.matchAll(/\saria-controls="([^"]+)"/g)].map((match) => match[1]);
+    const tabList = html.match(/<div[^>]*role="tablist"[^>]*>/)?.[0] ?? "";
+    const tabs = html.match(/<button[^>]*role="tab"[^>]*>/g) ?? [];
+
+    expect(tabs).toHaveLength(2);
+    expect(controls.filter((id) => !ids.has(id))).toEqual([]);
+    for (const tab of tabs) expect(tab).not.toContain("aria-controls");
+    expect(tabList).toContain('aria-label="Common.table.layout"');
+    expect(html).toContain('aria-label="Common.table.groupBy"');
+    expect(html).toContain('aria-label="Common.sort.field"');
+  });
+
+  it("disables the board control when a record list cannot board yet", () => {
+    const html = render(store({ canBoard: false }), "deals");
+
+    expect(html).toMatch(/id="deals-layout-board"[^>]*disabled=""|disabled=""[^>]*id="deals-layout-board"/);
+  });
+
+  it("offers no layout control on surfaces without a card renderer (rule 61)", () => {
+    const html = render(store({ canBoard: false, supportsBoard: false }), "settings-roles");
+
+    expect(html).not.toContain("settings-roles-layout-board");
+    expect(html).not.toContain('aria-label="Common.table.layout"');
+  });
+
+  it("shows the table as active for a stored card mode the surface cannot board", () => {
+    const html = render(store({ canBoard: false, viewMode: ViewMode.card }), "deals");
+
+    expect(html).toMatch(
+      /id="deals-layout-table"[^>]*data-state="active"|data-state="active"[^>]*id="deals-layout-table"/,
+    );
+  });
+
+  it("switches to the board without picking a grouping and keeps an active grouping", () => {
+    const setViewOptions = vi.fn();
+    render(store({ groupableFields: [STAGE], setViewOptions }));
+    harness.onLayoutChange?.("board");
+
+    expect(setViewOptions).toHaveBeenCalledWith({ viewMode: ViewMode.card });
+
+    setViewOptions.mockClear();
+    render(store({ grouping: STAGE.grouping, groupableFields: [STAGE], setViewOptions, viewMode: ViewMode.card }));
+    harness.onLayoutChange?.("table");
+
+    expect(setViewOptions).toHaveBeenCalledWith({ viewMode: ViewMode.table });
+  });
+
+  it("offers summaries only while the list is grouped and the list has number fields", () => {
+    const value = { id: "value", label: "Value" };
+    expect(render(store({ summaryFields: [value] }))).not.toContain("DataView.summaries");
+    expect(render(store({ grouping: STAGE.grouping }))).not.toContain("DataView.summaries");
+
+    const html = render(
+      store({
+        grouping: { ...STAGE.grouping, summaries: [{ fieldId: "value", aggregation: "sum" }] },
+        groupableFields: [STAGE],
+        summaryFields: [value, { id: "weighted", label: "Weighted value" }],
+      }),
+    );
+
+    expect(html).toContain("DataView.summaries");
+    expect(html).toContain('aria-label="RecordModel.summaryField"');
+    expect(html).toContain('aria-label="RecordModel.summaryAggregation"');
+    expect(html).toContain('data-value="weighted"');
+    expect(html).toContain("RecordModel.reducers.sum");
+    expect(html).toContain('aria-label="RecordModel.removeGroupSummary"');
+    expect(html).toContain("RecordModel.addGroupSummary");
+  });
+
+  it("proposes the next unused summary and stops at eight", () => {
+    const fields = [{ id: "value" }, { id: "weighted" }];
+    expect(nextGroupSummary([], fields)).toEqual({ fieldId: "value", aggregation: "sum" });
+    expect(nextGroupSummary([{ fieldId: "value", aggregation: "sum" }], fields)).toEqual({
+      fieldId: "weighted",
+      aggregation: "sum",
+    });
+    const full = (["sum", "average", "min", "max"] as const).flatMap((aggregation) =>
+      fields.map((field) => ({ fieldId: field.id, aggregation })),
+    );
+    expect(nextGroupSummary(full, [...fields, { id: "quantity" }])).toBeUndefined();
+  });
+
+  it("keeps the summaries when the grouping field changes", () => {
+    const setViewOptions = vi.fn();
+    const summaries = [{ fieldId: "value", aggregation: "sum" as const }];
+    const owner = { ...STAGE, id: "owner", grouping: { field: "system:assignedTo" } };
+    render(
+      store({
+        currentGroupableFieldId: "stage",
+        grouping: { ...STAGE.grouping, summaries },
+        groupableFields: [STAGE, owner],
+        setViewOptions,
+        summaryFields: [{ id: "value", label: "Value" }],
+      }),
+    );
+    expect(harness.onGroupingChange).toBeDefined();
+    harness.onGroupingChange?.("owner");
+
+    expect(setViewOptions).toHaveBeenCalledWith({ grouping: { field: "system:assignedTo", summaries } });
+  });
+});
+
+describe("calendar layout", () => {
+  const calendar = { dateFieldId: "close", endDateFieldId: null, colorFieldId: null, mode: "month" as const };
+  const calendarFieldOptions = {
+    dates: [
+      { id: "close", label: "Close date" },
+      { id: "start", label: "Start" },
+    ],
+    endsFor: (id: string) => (id === "start" ? [{ id: "end", label: "End" }] : []),
+    colors: [{ id: "stage", label: "Stage" }],
+  };
+
+  it("offers the calendar next to table and board and explains when a list has no date field", () => {
+    const html = render(store({ supportsCalendar: true, canCalendar: false } as never), "records");
+
+    expect(html).toContain('id="records-layout-calendar"');
+    expect(html).toContain("Common.table.layouts.calendar");
+    expect(html).toContain("Common.ariaLabels.switchToCalendarViewDisabled");
+    expect(render(store(), "records")).not.toContain("records-layout-calendar");
+  });
+
+  it("switches to the calendar with the list's default date field", () => {
+    const setViewOptions = vi.fn();
+    render(
+      store({ supportsCalendar: true, canCalendar: true, defaultCalendar: calendar, setViewOptions } as never),
+      "records",
+    );
+    harness.onLayoutChange?.("calendar");
+
+    expect(setViewOptions).toHaveBeenCalledWith({ viewMode: ViewMode.calendar, calendar });
+  });
+
+  it("shows the calendar fields instead of grouping and columns while the calendar is shown", () => {
+    const html = render(
+      store({
+        supportsCalendar: true,
+        canCalendar: true,
+        calendar: { ...calendar, dateFieldId: "start" },
+        calendarFieldOptions,
+        viewMode: ViewMode.calendar,
+        groupableFields: [STAGE],
+        orderedColumns: [{ uid: "name", label: "Name" }],
+      } as never),
+      "records",
+    );
+
+    expect(html).toContain('aria-label="DataView.calendar.dateField"');
+    expect(html).toContain('aria-label="DataView.calendar.endDateField"');
+    expect(html).toContain('aria-label="DataView.calendar.colorField"');
+    expect(html).toContain('data-value="end"');
+    expect(html).not.toContain('aria-label="Common.table.groupBy"');
+    expect(html).not.toContain("Common.table.fields");
+  });
+});
