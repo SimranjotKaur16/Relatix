@@ -1,0 +1,722 @@
+import { isCalendarDateField } from "@/features/record-calendar/record-calendar-query";
+import type { SortableField } from "@/core/base/base-query-builder";
+import { MANUAL_ORDER_SORT_KEY } from "@/features/records/record-column.schema";
+import type { GroupableFieldSpec } from "@/core/base/grouping/groupable-field";
+import type { DataViewConfigurationRepo } from "./data-view-configuration.repo";
+import type { QueryParamsPrecheckInteractor } from "@/core/base/query-params-precheck.interactor";
+import type { DataViewStateRepo } from "@/core/data-view/data-view-state.repo";
+import { isPersistedColumnWidthKey, type DataViewState } from "@/core/data-view/data-view-state.schema";
+import type { Validated } from "@/core/validation/validation.utils";
+import type { EntitlementService } from "@/ee/subscription/entitlement.service";
+import type { DeleteDataViewInteractor } from "./delete-data-view.interactor";
+import type {
+  AgentDataViewState,
+  DataViewConfigSection,
+  ManageDataViewsData,
+  ManageDataViewsResult,
+} from "./manage-data-views.schema";
+import type { ResetDataViewStateInteractor } from "./reset-data-view-state.interactor";
+import type { SaveDataViewStateInteractor } from "./save-data-view-state.interactor";
+import type { SelectDataViewInteractor } from "./select-data-view.interactor";
+import type { UpsertDataViewInteractor } from "./upsert-data-view.interactor";
+
+import equal from "fast-deep-equal/es6";
+import { AuthenticatedInteractor } from "@/core/base/authenticated-interactor";
+import { ViewMode } from "@/core/base/base-query-builder";
+import { resolveGrouping } from "@/core/base/grouping/group-axis";
+import { groupableFieldDtos } from "@/core/base/grouping/groupable-field";
+import {
+  AI_MANAGEABLE_DATA_VIEW_SURFACE_KEYS,
+  isAiManageableDataViewSurface,
+  isRecordDataViewSurface,
+  type AiManageableDataViewSurfaceKey,
+  type BuiltinAiManageableDataViewSurfaceKey,
+} from "@/core/data-view/ai-manageable-surfaces";
+import { activityViewFilterableFields } from "@/ee/messaging/activities/record-activity-view";
+import { ACTIVITY_KINDS, CHANGE_ACTIVITY_KINDS } from "@/ee/messaging/activities/activities.schema";
+import { ALL_VIEW_KEY, SURFACE, isActivitySurface } from "@/core/data-view/data-view-keys";
+import { AllowInDemoMode } from "@/core/decorators/allow-in-demo-mode.decorator";
+import { TenantInteractor } from "@/core/decorators/tenant-interactor.decorator";
+import { ValidateOutput } from "@/core/decorators/validate-output.decorator";
+import { Validate } from "@/core/decorators/validate.decorator";
+import { FilterFieldKey } from "@/core/types/filter-field-key";
+import { filterFieldAgentNote, filterValueKind, TIMELINE_KIND_VIEW_VALUES } from "@/core/types/filter-field-value-kind";
+import { fail, failAuthorization, failNotFound } from "@/core/validation/interactor-failure-server";
+import { runPrecheck } from "@/core/validation/run-precheck";
+import { CustomErrorCode } from "@/core/validation/validation.types";
+import { DomainEvent } from "@/features/event/domain-events";
+import { recordFilterableFields } from "@/features/records/record-presentation";
+import type { RecordViewPolicy } from "@/features/records/record-view-policy";
+import type { Resource } from "@/generated/prisma";
+import { Action } from "@/generated/prisma";
+import { DATA_VIEW_SURFACES, type SurfaceDescriptor } from "./data-view-surfaces";
+import { ManageDataViewsResultSchema, ManageDataViewsSchema } from "./manage-data-views.schema";
+import { isRecordSortField } from "@/features/records/record-query-validation";
+
+type DataViewConfigurationSources = Record<
+  Exclude<
+    BuiltinAiManageableDataViewSurfaceKey,
+    typeof SURFACE.entityTimeline | typeof SURFACE.activity | typeof SURFACE.dashboard
+  >,
+  DataViewConfigurationRepo
+>;
+
+function matchesQuery(value: Record<string, unknown>, query: string | undefined, keys: readonly string[]) {
+  if (!query) return true;
+  const normalized = query.toLocaleLowerCase();
+  return keys.some((key) => {
+    const candidate = value[key];
+    return typeof candidate === "string" && candidate.toLocaleLowerCase().includes(normalized);
+  });
+}
+
+function paged<T>(items: readonly T[], page: number, pageSize: number) {
+  const total = items.length;
+  const start = (page - 1) * pageSize;
+  return {
+    total,
+    page,
+    pageSize,
+    totalPages: Math.max(1, Math.ceil(total / pageSize)),
+    items: items.slice(start, start + pageSize),
+  };
+}
+
+const RELATED_RECORD_FILTER_NOTE =
+  "Linked records: in/notIn take the linked record ids (find them with search_crm_records); hasSome/hasNone test whether any link exists.";
+
+@AllowInDemoMode
+@TenantInteractor()
+export class ManageDataViewsInteractor extends AuthenticatedInteractor<ManageDataViewsData, ManageDataViewsResult> {
+  constructor(
+    private sources: DataViewConfigurationSources,
+    private views: DataViewStateRepo,
+    private upsert: UpsertDataViewInteractor,
+    private saveState: SaveDataViewStateInteractor,
+    private select: SelectDataViewInteractor,
+    private remove: DeleteDataViewInteractor,
+    private queryPrecheck: QueryParamsPrecheckInteractor,
+    private entitlements: EntitlementService,
+    private recordViews?: RecordViewPolicy,
+    private reset?: ResetDataViewStateInteractor,
+  ) {
+    super();
+  }
+
+  @Validate(ManageDataViewsSchema)
+  @ValidateOutput(ManageDataViewsResultSchema)
+  invoke(data: ManageDataViewsData): Validated<ManageDataViewsResult> {
+    return this.manage(data, false);
+  }
+
+  @Validate(ManageDataViewsSchema)
+  @ValidateOutput(ManageDataViewsResultSchema)
+  propose(data: ManageDataViewsData): Validated<ManageDataViewsResult> {
+    return this.manage(data, true);
+  }
+
+  private async manage(data: ManageDataViewsData, propose: boolean): Validated<ManageDataViewsResult> {
+    if (data.action === "surfaces") {
+      const surfaces = [];
+      for (const surfaceKey of AI_MANAGEABLE_DATA_VIEW_SURFACE_KEYS) {
+        if (await this.accessDenied(surfaceKey)) continue;
+        const { label, path } = DATA_VIEW_SURFACES[surfaceKey];
+        surfaces.push({ surfaceKey, label, path });
+      }
+      if (this.recordViews) surfaces.push(...(await this.recordViews.list()));
+      return {
+        ok: true,
+        data: { action: data.action, total: surfaces.length, items: surfaces },
+      };
+    }
+
+    if (!isAiManageableDataViewSurface(data.surfaceKey))
+      return failAuthorization(CustomErrorCode.permissionDenied, ["surfaceKey"]);
+
+    const denied = await this.accessDenied(data.surfaceKey);
+    if (denied) return denied;
+    const descriptor: SurfaceDescriptor = isRecordDataViewSurface(data.surfaceKey)
+      ? {
+          label: (await this.recordViews?.describe(data.surfaceKey))?.type.pluralLabel ?? "Records",
+          path: `/records/${data.surfaceKey.slice(8)}`,
+        }
+      : DATA_VIEW_SURFACES[data.surfaceKey];
+    const location = { surfaceKey: data.surfaceKey, path: descriptor.path };
+
+    if (data.action === "config") {
+      const config = await this.configuration(data.surfaceKey);
+      const section = data.section ?? "overview";
+      const writableStateFields = isActivitySurface(data.surfaceKey)
+        ? ["filters", "sortDescriptor"]
+        : [
+            "filters",
+            "searchTerm",
+            "sortDescriptor",
+            "pageSize",
+            "viewMode",
+            "grouping",
+            "columnOrder",
+            "columnWidths",
+            "hiddenColumns",
+            ...(isRecordDataViewSurface(data.surfaceKey) ? ["calendar"] : []),
+          ];
+      const filterableFields = config.filterableFields.map((field) => {
+        const valueKind = filterValueKind(field.field);
+        const values =
+          config.filterValues?.get(field.field) ??
+          field.options?.map((option) => option.value) ??
+          (field.field === FilterFieldKey.timelineKind.toString()
+            ? TIMELINE_KIND_VIEW_VALUES
+            : valueKind?.kind === "enum"
+              ? valueKind.values
+              : valueKind?.kind === "event"
+                ? Object.values(DomainEvent)
+                : undefined);
+        const description =
+          filterFieldAgentNote(field.field) ??
+          (field.field.startsWith("relationship:") || field.field.startsWith("path:")
+            ? RELATED_RECORD_FILTER_NOTE
+            : undefined);
+        return {
+          ...field,
+          ...(values ? { values } : {}),
+          ...(description ? { description } : {}),
+        };
+      });
+      const sortableFields = [...config.sortableFields.map(({ field }) => ({ field }))];
+      const groupableFields = config.groupableDtos;
+      const totals = {
+        filters: filterableFields.length,
+        sorting: sortableFields.length,
+        grouping: groupableFields.length,
+        appearance: config.appearance.length,
+      };
+      if (section === "overview") {
+        return {
+          ok: true,
+          data: {
+            action: data.action,
+            ...location,
+            label: descriptor.label,
+            section,
+            totals,
+            supportsSearch: config.supportsSearch,
+            viewModes: config.viewModes,
+            writableStateFields,
+          },
+        };
+      }
+      type ResultItem = NonNullable<ManageDataViewsResult["items"]>[number];
+      const sectionItems: Record<Exclude<DataViewConfigSection, "overview">, readonly ResultItem[]> = {
+        filters: filterableFields as ResultItem[],
+        sorting: sortableFields as ResultItem[],
+        grouping: groupableFields as ResultItem[],
+        appearance: config.appearance as ResultItem[],
+      };
+      const result = paged(
+        sectionItems[section].filter((item) =>
+          matchesQuery(item, data.query, section === "grouping" ? ["id", "label", "labelKey"] : ["field", "label"]),
+        ),
+        data.page ?? 1,
+        data.pageSize ?? 10,
+      );
+      return {
+        ok: true,
+        data: {
+          action: data.action,
+          ...location,
+          label: descriptor.label,
+          section,
+          ...result,
+        },
+      };
+    }
+
+    const surfaceState = await this.views.loadSurfaceState(data.surfaceKey);
+    if (data.action === "list" || data.action === "read") {
+      if (data.viewKey === ALL_VIEW_KEY) {
+        return {
+          ok: true,
+          data: {
+            action: data.action,
+            ...location,
+            total: 1,
+            page: 1,
+            pageSize: 1,
+            totalPages: 1,
+            items: [
+              {
+                id: ALL_VIEW_KEY,
+                name: "All",
+                position: -1,
+                state: await this.liveState(data.surfaceKey, surfaceState.allState),
+              },
+            ],
+            activeViewKey: surfaceState.activeViewKey,
+          },
+        };
+      }
+      if (data.viewKey) {
+        const view = surfaceState.views.find((candidate) => candidate.id === data.viewKey);
+        if (!view) return failNotFound(CustomErrorCode.dataViewNotFound, ["viewKey"]);
+        return {
+          ok: true,
+          data: {
+            action: data.action,
+            ...location,
+            total: 1,
+            page: 1,
+            pageSize: 1,
+            totalPages: 1,
+            items: [{ ...view, state: await this.liveState(data.surfaceKey, view.state) }],
+            activeViewKey: surfaceState.activeViewKey,
+          },
+        };
+      }
+      const listing: { page?: number; pageSize?: number; query?: string } = data.action === "list" ? data : {};
+      const candidates = surfaceState.views.map(({ id, name, position }) => ({
+        id,
+        name,
+        position,
+      }));
+      const result = paged(
+        candidates.filter((item) => matchesQuery(item, listing.query, ["id", "name"])),
+        listing.page ?? 1,
+        listing.pageSize ?? 10,
+      );
+      return {
+        ok: true,
+        data: {
+          action: data.action,
+          ...location,
+          ...result,
+          activeViewKey: surfaceState.activeViewKey,
+        },
+      };
+    }
+
+    if (data.action === "create") {
+      const checked = await this.validateState(data.surfaceKey, data.state);
+      if (!checked.ok) return checked;
+      if (propose) {
+        return {
+          ok: true,
+          data: {
+            action: data.action,
+            ...location,
+            viewKey: ALL_VIEW_KEY,
+            name: data.name,
+            state: withoutSearch(data.state),
+            proposed: true,
+            link: this.link(descriptor.path, ALL_VIEW_KEY),
+          },
+        };
+      }
+      const result = await this.upsert.invoke({
+        surfaceKey: data.surfaceKey,
+        name: data.name,
+        state: data.state,
+      });
+      if (!result.ok) return result;
+      return {
+        ok: true,
+        data: {
+          action: data.action,
+          ...result.data,
+          ...location,
+          viewKey: result.data.id,
+          link: this.link(descriptor.path, result.data.id),
+          selected: true,
+        },
+      };
+    }
+
+    const owned = surfaceState.views.find((view) => view.id === data.viewKey);
+    if (data.viewKey !== ALL_VIEW_KEY && !owned) return failNotFound(CustomErrorCode.dataViewNotFound, ["viewKey"]);
+
+    if (data.action === "reset") {
+      if (!this.reset) return failAuthorization(CustomErrorCode.permissionDenied);
+      const result = await this.reset.invoke({
+        surfaceKey: data.surfaceKey,
+        viewKey: data.viewKey,
+        fields: data.fields,
+      });
+      if (!result.ok) return result;
+      return {
+        ok: true,
+        data: {
+          action: data.action,
+          ...location,
+          viewKey: data.viewKey,
+          link: this.link(descriptor.path, data.viewKey),
+        },
+      };
+    }
+    if (data.action === "select") {
+      const result = await this.select.invoke({
+        surfaceKey: data.surfaceKey,
+        viewKey: data.viewKey,
+      });
+      if (!result.ok) return result;
+      return {
+        ok: true,
+        data: {
+          action: data.action,
+          ...location,
+          viewKey: data.viewKey,
+          selected: true,
+          link: this.link(descriptor.path, data.viewKey),
+        },
+      };
+    }
+    if (data.action === "delete") {
+      if (!owned) return failNotFound(CustomErrorCode.dataViewNotFound, ["viewKey"]);
+      if (data.name !== undefined && owned.name !== data.name)
+        return fail(CustomErrorCode.dataViewNameMismatch, ["name"]);
+      const result = await this.remove.invoke({ id: data.viewKey });
+      if (!result.ok) return result;
+      return {
+        ok: true,
+        data: {
+          action: data.action,
+          ...location,
+          viewKey: data.viewKey,
+          name: owned.name,
+          deleted: true,
+          trashBatchId: result.data.trashBatchId,
+        },
+      };
+    }
+
+    if (data.viewKey === ALL_VIEW_KEY && data.name !== undefined)
+      return fail(CustomErrorCode.dataViewAllNameImmutable, ["name"]);
+    const currentState = owned?.state ?? surfaceState.allState;
+    const name = data.name !== undefined && data.name !== owned?.name ? data.name : undefined;
+
+    const changed = Object.entries(data.state ?? {}).filter(
+      ([field, value]) => !equal(value, currentState[field as keyof typeof currentState]),
+    );
+    const state = changed.length > 0 ? (Object.fromEntries(changed) as AgentDataViewState) : undefined;
+
+    if (name === undefined && state === undefined) {
+      return {
+        ok: true,
+        data: {
+          action: data.action,
+          ...(owned ?? { state: currentState }),
+          ...location,
+          viewKey: data.viewKey,
+          link: this.link(descriptor.path, data.viewKey),
+        },
+      };
+    }
+
+    if (state !== undefined) {
+      const checked = await this.validateState(data.surfaceKey, state);
+      if (!checked.ok) return checked;
+    }
+    if (propose) {
+      return {
+        ok: true,
+        data: {
+          action: data.action,
+          ...location,
+          viewKey: data.viewKey,
+          ...(name !== undefined ? { name } : {}),
+          state: withoutSearch(state ?? {}),
+          proposed: true,
+          link: this.link(descriptor.path, data.viewKey),
+        },
+      };
+    }
+    if (owned) {
+      const result = await this.upsert.invoke({
+        id: owned.id,
+        surfaceKey: data.surfaceKey,
+        ...(name !== undefined ? { name } : {}),
+        ...(state !== undefined ? { state } : {}),
+      });
+      if (!result.ok) return result;
+      return {
+        ok: true,
+        data: {
+          action: data.action,
+          ...result.data,
+          ...location,
+          viewKey: owned.id,
+          link: this.link(descriptor.path, owned.id),
+        },
+      };
+    }
+    const result = await this.saveState.invoke({
+      surfaceKey: data.surfaceKey,
+      viewKey: ALL_VIEW_KEY,
+      state: state ?? {},
+    });
+    if (!result.ok) return result;
+    const savedAllState = result.data;
+    if (!("state" in savedAllState))
+      throw new Error("SaveDataViewStateInteractor returned a named-view result while saving the All view");
+
+    return {
+      ok: true,
+      data: {
+        action: data.action,
+        ...location,
+        viewKey: ALL_VIEW_KEY,
+        state: savedAllState.state,
+        link: this.link(descriptor.path, ALL_VIEW_KEY),
+      },
+    };
+  }
+
+  private hasRead(resource: Resource, readAllOnly = false): boolean {
+    return Boolean(
+      this.user.role?.isSystemRole ||
+        this.user.role?.permissions.some(
+          (permission) =>
+            permission.resource === resource &&
+            (permission.action === Action.readAll || (!readAllOnly && permission.action === Action.readOwn)),
+        ),
+    );
+  }
+
+  private async accessDenied(surfaceKey: AiManageableDataViewSurfaceKey) {
+    if (isRecordDataViewSurface(surfaceKey)) {
+      const invalid =
+        (await this.recordViews?.validate(surfaceKey)) ?? (this.recordViews ? null : CustomErrorCode.permissionDenied);
+      if (invalid === CustomErrorCode.recordTypeNotFound) return failNotFound(invalid, ["surfaceKey"]);
+      return invalid ? failAuthorization(invalid, ["surfaceKey"]) : null;
+    }
+    const descriptor = DATA_VIEW_SURFACES[surfaceKey];
+    if (descriptor.resource && !this.hasRead(descriptor.resource, descriptor.readAllOnly))
+      return failAuthorization(CustomErrorCode.permissionDenied, ["surfaceKey"]);
+
+    if (descriptor.messaging) return this.entitlements.require("messaging");
+
+    return null;
+  }
+
+  private async configuration(surfaceKey: AiManageableDataViewSurfaceKey) {
+    if (isRecordDataViewSurface(surfaceKey)) {
+      const description = await this.recordViews?.describe(surfaceKey);
+      const fields = description?.fields ?? [];
+      const columns =
+        description?.columns ??
+        fields.map((field) => ({
+          kind: "field" as const,
+          id: field.id,
+          label: field.label,
+          sortable: isRecordSortField(field),
+          field,
+        }));
+      return {
+        filterableFields: recordFilterableFields(
+          fields,
+          description?.relationships,
+          description?.type.id,
+          description?.type.relationshipPaths,
+        ),
+        filterValues: new Map(
+          fields
+            .filter((field) => field.valueType === "select" && !field.multiple)
+            .map((field) => [field.id, field.options.map((option) => option.id)]),
+        ),
+        sortableFields: [
+          ...columns
+            .filter((column) => column.sortable)
+            .map((column) => ({
+              field: column.id,
+              resolvedFields: [column.id],
+              label: column.label,
+            })),
+          {
+            field: MANUAL_ORDER_SORT_KEY,
+            resolvedFields: [MANUAL_ORDER_SORT_KEY],
+            label: "Manual",
+          },
+        ],
+        groupableFields: [] as GroupableFieldSpec[],
+        groupableDtos: fields
+          .filter((field) => field.valueType === "select" && !field.multiple)
+          .map((field) => ({
+            id: field.id,
+            grouping: { field: field.id },
+            kind: "customSingleSelect" as const,
+            label: field.label,
+            supportsDragWriteBack: false,
+          })),
+        appearance: columns.map((column) => ({
+          id: column.id,
+          field: column.id,
+          label: column.label,
+          valueType:
+            column.kind === "field"
+              ? column.field.valueType
+              : column.kind === "relationship"
+                ? "relationship"
+                : column.id === "system:assignedTo"
+                  ? "member"
+                  : "dateTime",
+        })),
+        supportsSearch: true,
+        viewModes: [
+          ViewMode.table,
+          ...(fields.some((field) => field.valueType === "select" && !field.multiple) ? [ViewMode.card] : []),
+          ...(fields.some(isCalendarDateField) ? [ViewMode.calendar] : []),
+        ],
+      };
+    }
+    if (isActivitySurface(surfaceKey)) {
+      const types = (await this.recordViews?.list()) ?? [];
+      return {
+        filterableFields: activityViewFilterableFields(
+          types,
+          surfaceKey === SURFACE.activity ? CHANGE_ACTIVITY_KINDS : ACTIVITY_KINDS,
+        ),
+        sortableFields: [{ field: "at", resolvedFields: ["at"] }] as SortableField[],
+        groupableFields: [] as GroupableFieldSpec[],
+        groupableDtos: [],
+        filterValues: undefined,
+        appearance: [],
+        supportsSearch: false,
+        viewModes: [ViewMode.table],
+      };
+    }
+    if (surfaceKey === SURFACE.dashboard) {
+      return {
+        filterableFields: [],
+        sortableFields: [] as SortableField[],
+        groupableFields: [] as GroupableFieldSpec[],
+        groupableDtos: [],
+        filterValues: undefined,
+        appearance: [],
+        supportsSearch: false,
+        viewModes: [ViewMode.table],
+      };
+    }
+    const source = this.sources[surfaceKey];
+    const filterableFields = await source.getFilterableFields();
+    const groupableFields = await source.getGroupableFields();
+    return {
+      filterableFields,
+      sortableFields: source.getSortableFields(),
+      groupableFields,
+      groupableDtos: groupableFieldDtos(groupableFields),
+      filterValues: undefined,
+      appearance: [...source.getSortableFields().map(({ field }) => ({ id: field, field }))],
+      supportsSearch: source.getSearchableFields().length > 0,
+      viewModes: groupableFields.length > 0 ? [ViewMode.table, ViewMode.card] : [ViewMode.table],
+    };
+  }
+
+  private liveState(surfaceKey: AiManageableDataViewSurfaceKey, state: DataViewState): Promise<DataViewState> {
+    return isRecordDataViewSurface(surfaceKey) && this.recordViews
+      ? this.recordViews.liveState(surfaceKey, state)
+      : Promise.resolve(state);
+  }
+
+  private async validateState(surfaceKey: AiManageableDataViewSurfaceKey, state: AgentDataViewState) {
+    if (isRecordDataViewSurface(surfaceKey) || isActivitySurface(surfaceKey)) {
+      const groupable =
+        isRecordDataViewSurface(surfaceKey) && state.grouping
+          ? await this.recordViews?.unsupportedGrouping(surfaceKey, state.grouping)
+          : null;
+      if (groupable)
+        return fail(CustomErrorCode.invalidGroupingField, ["state", "grouping"], { validValues: groupable.join(", ") });
+      if (isActivitySurface(surfaceKey) && (state.calendar || state.viewMode === ViewMode.calendar))
+        return fail(CustomErrorCode.recordValueInvalid, ["state", "calendar"]);
+      const calendar =
+        isRecordDataViewSurface(surfaceKey) && state.calendar
+          ? await this.recordViews?.invalidCalendar(surfaceKey, state.calendar)
+          : null;
+      if (calendar) {
+        return fail(CustomErrorCode.invalidFilterField, ["state", "calendar", calendar.key], {
+          validValues: calendar.validValues.join(", "),
+        });
+      }
+
+      const invalid =
+        (await this.recordViews?.validate(surfaceKey, state)) ??
+        (this.recordViews ? null : CustomErrorCode.permissionDenied);
+      const filter =
+        invalid === CustomErrorCode.recordValueInvalid && isRecordDataViewSurface(surfaceKey)
+          ? await this.recordViews?.invalidFilter(surfaceKey, state.filters ?? [])
+          : null;
+      if (filter) return fail(filter.code, ["state", "filters", filter.index], filter.values);
+      return invalid ? fail(invalid, ["state"]) : { ok: true as const, data: state };
+    }
+    const config = await this.configuration(surfaceKey);
+    return runPrecheck(state, async (input, ctx) => {
+      await this.queryPrecheck.invoke(
+        config,
+        {
+          filters: input.filters,
+          sortDescriptor: input.sortDescriptor ?? undefined,
+        },
+        ctx,
+      );
+      if (input.searchTerm && !config.supportsSearch) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["searchTerm"],
+          params: {
+            error: CustomErrorCode.invalidFilterField,
+            validValues: "",
+          },
+        });
+      }
+      if (input.viewMode && !config.viewModes.includes(input.viewMode)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["viewMode"],
+          params: {
+            error: CustomErrorCode.invalidFilterValue,
+            value: input.viewMode,
+          },
+        });
+      }
+      const columnIds = new Set(config.appearance.map(({ id }) => id));
+      for (const key of ["columnOrder", "hiddenColumns", "columnWidths"] as const) {
+        const invalid =
+          key === "columnWidths"
+            ? Object.keys(input[key] ?? {}).some((id) => !isPersistedColumnWidthKey(id, columnIds))
+            : (input[key] ?? []).some((id) => !columnIds.has(id));
+        if (invalid) {
+          ctx.addIssue({
+            code: "custom",
+            path: [key],
+            params: {
+              error: CustomErrorCode.invalidFilterField,
+              validValues: [...columnIds].join(", "),
+            },
+          });
+        }
+      }
+      const resolved = input.grouping ? resolveGrouping(input.grouping, config.groupableFields) : undefined;
+      if (
+        input.grouping &&
+        (!resolved || (input.grouping.bucket !== undefined && input.grouping.bucket !== resolved.grouping.bucket))
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["grouping"],
+          params: {
+            error: CustomErrorCode.invalidFilterField,
+            validValues: config.groupableFields.map(({ field }) => field).join(", "),
+          },
+        });
+      }
+    });
+  }
+
+  private link(path: string | null, viewKey: string): string | null {
+    return path && `${path}?view=${encodeURIComponent(viewKey)}`;
+  }
+}
+
+function withoutSearch<S extends { searchTerm?: unknown }>(state: S): Omit<S, "searchTerm"> {
+  const rest: S = { ...state };
+  delete rest.searchTerm;
+  return rest;
+}
