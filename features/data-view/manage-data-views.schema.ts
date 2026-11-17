@@ -1,0 +1,208 @@
+import { ResetDataViewStateSchema } from "./reset-data-view-state.schema";
+import type { Data } from "@/core/validation/validation.utils";
+
+import { z } from "zod";
+
+import { FilterSchema, SortDescriptorSchema } from "@/core/base/base-get.schema";
+import { GroupingSchema } from "@/core/base/grouping/grouping.schema";
+import { CalendarViewConfigSchema } from "@/core/data-view/calendar-view-config.schema";
+import { ViewMode } from "@/core/base/base-query-builder";
+import { AiManageableDataViewSurfaceKeySchema } from "@/core/data-view/ai-manageable-surfaces";
+import { dataViewPath } from "@/core/data-view/data-view-paths";
+import { stripWorkspacePrefix } from "@/core/navigation/workspace-paths";
+import { DATA_VIEW_NAME_MAX_LENGTH } from "@/core/data-view/data-view-limits";
+import {
+  DataViewPageSizeSchema,
+  DataViewStateWireSchema,
+  ViewKeySchema,
+} from "@/core/data-view/data-view-state.schema";
+import { CustomErrorCode } from "@/core/validation/validation.types";
+import { zx } from "@/core/validation/validation.utils";
+
+export const AgentDataViewStateSchema = z
+  .object({
+    filters: z.array(FilterSchema).max(50).optional(),
+    searchTerm: zx.nulFreeText().max(200).optional(),
+    sortDescriptor: SortDescriptorSchema.nullable().optional(),
+    pageSize: DataViewPageSizeSchema.optional(),
+    viewMode: z.enum(ViewMode).optional(),
+    grouping: GroupingSchema.nullable().optional(),
+    columnOrder: z.array(z.string()).max(200).optional(),
+    columnWidths: z.record(z.string(), z.number().finite().min(40).max(2000)).optional(),
+    hiddenColumns: z.array(z.string()).max(200).optional(),
+    calendar: CalendarViewConfigSchema.nullable()
+      .optional()
+      .describe(
+        "Record lists only. Settings of the calendar layout (viewMode calendar): dateFieldId is a date, date-time or date range field from config appearance, the optional endDateFieldId a second field of the same date or date-time type, colorFieldId a single-choice field, mode month, week or agenda. Null removes them.",
+      ),
+  })
+  .strict();
+export type AgentDataViewState = Data<typeof AgentDataViewStateSchema>;
+
+export const DataViewConfigSectionSchema = z.enum(["overview", "filters", "sorting", "grouping", "appearance"]);
+export type DataViewConfigSection = z.infer<typeof DataViewConfigSectionSchema>;
+
+export const ManageDataViewPageSchema = z.coerce.number().int().min(1).max(10_000);
+export const ManageDataViewPageSizeSchema = z.coerce.number().int().min(1).max(25);
+export const ManageDataViewQuerySchema = z.string().trim().min(1).max(100).optional();
+
+const surface = { surfaceKey: AiManageableDataViewSurfaceKeySchema };
+const page = {
+  page: ManageDataViewPageSchema.optional(),
+  pageSize: ManageDataViewPageSizeSchema.optional(),
+  query: ManageDataViewQuerySchema,
+};
+
+const update = {
+  ...surface,
+  viewKey: ViewKeySchema,
+  name: z.string().trim().min(1).max(DATA_VIEW_NAME_MAX_LENGTH).optional(),
+  state: AgentDataViewStateSchema.optional(),
+};
+
+function requireUpdateChange(data: { name?: string; state?: AgentDataViewState }, ctx: z.RefinementCtx) {
+  if (data.name !== undefined || (data.state !== undefined && Object.keys(data.state).length > 0)) return;
+  ctx.addIssue({
+    code: "custom",
+    path: [],
+    params: { error: CustomErrorCode.dataViewUpdateEmpty },
+  });
+}
+
+const UpdateDataViewSchema = z
+  .object({ action: z.literal("update"), ...update })
+  .strict()
+  .superRefine(requireUpdateChange);
+
+export const DataViewSurfacesRequestSchema = z.object({}).strict();
+export const DataViewConfigRequestSchema = z
+  .object({ ...surface, section: DataViewConfigSectionSchema.optional(), ...page })
+  .strict();
+export const ListDataViewsRequestSchema = z.object({ ...surface, ...page }).strict();
+export const ReadDataViewRequestSchema = z.object({ ...surface, viewKey: ViewKeySchema }).strict();
+export const CreateDataViewRequestSchema = z
+  .object({
+    ...surface,
+    name: z.string().trim().min(1).max(DATA_VIEW_NAME_MAX_LENGTH),
+    state: AgentDataViewStateSchema,
+  })
+  .strict();
+export const UpdateDataViewRequestSchema = z.object(update).strict().superRefine(requireUpdateChange);
+export const SelectDataViewRequestSchema = z.object({ ...surface, viewKey: ViewKeySchema }).strict();
+export const DeleteDataViewRequestSchema = z
+  .object({ ...surface, viewKey: z.uuid(), name: z.string().trim().min(1).max(DATA_VIEW_NAME_MAX_LENGTH).optional() })
+  .strict();
+
+export const ManageDataViewsSchema = z.discriminatedUnion("action", [
+  DataViewSurfacesRequestSchema.extend({ action: z.literal("surfaces") }),
+  DataViewConfigRequestSchema.extend({ action: z.literal("config") }),
+  ListDataViewsRequestSchema.extend({ action: z.literal("list"), viewKey: ViewKeySchema.optional() }),
+  ReadDataViewRequestSchema.extend({ action: z.literal("read") }),
+  CreateDataViewRequestSchema.extend({ action: z.literal("create") }),
+  UpdateDataViewSchema,
+  ResetDataViewStateSchema.extend({ action: z.literal("reset") }),
+  SelectDataViewRequestSchema.extend({ action: z.literal("select") }),
+  DeleteDataViewRequestSchema.extend({ action: z.literal("delete") }),
+]);
+export type ManageDataViewsData = Data<typeof ManageDataViewsSchema>;
+
+const ResultItemSchema = z.looseObject({
+  id: z.string().optional(),
+  surfaceKey: AiManageableDataViewSurfaceKeySchema.optional(),
+  name: z.string().optional(),
+  label: z.string().optional(),
+  path: z.string().nullable().optional(),
+  position: z.number().int().optional(),
+  state: DataViewStateWireSchema.optional(),
+  field: z.string().optional(),
+  operators: z.array(z.string()).optional(),
+});
+
+export const ManageDataViewsResultSchema = z
+  .looseObject({
+    action: z.enum(["surfaces", "config", "list", "read", "create", "update", "select", "delete", "reset"]),
+    surfaceKey: AiManageableDataViewSurfaceKeySchema.optional(),
+    label: z.string().optional(),
+    path: z.string().nullable().optional(),
+    section: DataViewConfigSectionSchema.optional(),
+    total: z.number().int().min(0).optional(),
+    page: z.number().int().min(1).optional(),
+    pageSize: z.number().int().min(1).optional(),
+    totalPages: z.number().int().min(1).optional(),
+    items: z.array(ResultItemSchema).optional(),
+    totals: z.record(z.string(), z.number().int().min(0)).optional(),
+    supportsSearch: z.boolean().optional(),
+    viewModes: z.array(z.enum(ViewMode)).optional(),
+    writableStateFields: z.array(z.string()).optional(),
+    activeViewKey: z.string().nullable().optional(),
+    allState: DataViewStateWireSchema.optional(),
+    viewKey: ViewKeySchema.optional(),
+    id: z.string().optional(),
+    name: z.string().optional(),
+    position: z.number().int().optional(),
+    state: DataViewStateWireSchema.optional(),
+    link: z.string().nullable().optional(),
+    selected: z.boolean().optional(),
+    deleted: z.boolean().optional(),
+    proposed: z.literal(true).optional(),
+    trashBatchId: z.uuid().optional(),
+  })
+  .superRefine((result, ctx) => {
+    const requireField = (field: "surfaceKey" | "viewKey" | "link") => {
+      if (result[field] !== undefined) return;
+      ctx.addIssue({
+        code: "custom",
+        path: [field],
+        message: `${field} is required for ${result.action}`,
+      });
+    };
+
+    if (result.proposed && result.action === "create") {
+      requireField("surfaceKey");
+      if (result.state === undefined)
+        ctx.addIssue({ code: "custom", path: ["state"], message: "state is required for a proposal" });
+      return;
+    }
+    if (["create", "update", "select", "reset"].includes(result.action)) {
+      requireField("surfaceKey");
+      requireField("viewKey");
+      requireField("link");
+      if (result.surfaceKey && result.viewKey && result.link !== undefined) {
+        const path = dataViewPath(result.surfaceKey);
+        const expectedLink = path ? `${path}?view=${result.viewKey}` : null;
+        const linkPath = result.link && URL.canParse(result.link) ? new URL(result.link) : null;
+        const linkPathname = linkPath ? stripWorkspacePrefix(linkPath.pathname) : undefined;
+        if (result.link !== expectedLink && `${linkPathname}${linkPath?.search}` !== expectedLink) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["link"],
+            message: `link must match ${result.surfaceKey}`,
+          });
+        }
+      }
+    }
+    if (result.action === "create" || result.action === "select") {
+      if (result.selected !== true) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["selected"],
+          message: `selected must be true for ${result.action}`,
+        });
+      }
+    }
+    if (result.action === "delete") {
+      requireField("surfaceKey");
+      requireField("viewKey");
+      if (result.deleted !== true) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["deleted"],
+          message: "deleted must be true for delete",
+        });
+      }
+    }
+  })
+  .describe(
+    "surfaces, config and list return total before paged items; mutations return their action, surfaceKey, viewKey and resulting state/link or selected/deleted flag. In the app, create and update return proposed: true with the proposed state; the person saves or resets it.",
+  );
+export type ManageDataViewsResult = Data<typeof ManageDataViewsResultSchema>;
