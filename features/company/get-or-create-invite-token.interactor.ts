@@ -1,0 +1,49 @@
+import { nanoid } from "nanoid";
+import { z } from "zod";
+import { Resource } from "@/generated/prisma";
+
+import { AuthenticatedInteractor } from "@/core/base/authenticated-interactor";
+import { TenantInteractor } from "@/core/decorators/tenant-interactor.decorator";
+import { AllowInDemoMode } from "@/core/decorators/allow-in-demo-mode.decorator";
+import { Transaction } from "@/core/decorators/transaction.decorator";
+import { ValidateOutput } from "@/core/decorators/validate-output.decorator";
+import type { GetOrCreateInviteTokenRepo } from "./get-or-create-invite-token.repo";
+
+const OutputSchema = z.object({
+  token: z.string(),
+  expiresAt: z.date(),
+});
+
+const INVITE_TOKEN_EXPIRY_DAYS = 7;
+
+@AllowInDemoMode
+@TenantInteractor({ resource: Resource.users, manage: "create" })
+export class GetOrCreateInviteTokenInteractor extends AuthenticatedInteractor<
+  void,
+  { token: string; expiresAt: Date }
+> {
+  constructor(private repo: GetOrCreateInviteTokenRepo) {
+    super();
+  }
+
+  @Transaction
+  @ValidateOutput(OutputSchema)
+  async invoke(): Promise<{ ok: true; data: { token: string; expiresAt: Date } }> {
+    const existingToken = await this.repo.findUnexpiredToken();
+
+    if (existingToken)
+      return { ok: true as const, data: { token: existingToken.token, expiresAt: existingToken.expiresAt } };
+
+    const token = nanoid(32);
+    const expiresAt = new Date();
+
+    expiresAt.setDate(expiresAt.getDate() + INVITE_TOKEN_EXPIRY_DAYS);
+
+    const inviteToken = await this.repo.createInviteToken({
+      token,
+      expiresAt,
+    });
+
+    return { ok: true as const, data: { token: inviteToken.token, expiresAt: inviteToken.expiresAt } };
+  }
+}
