@@ -1,0 +1,155 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { createMockUser } from "@/tests/helpers/mock-user";
+import {
+  MOCK_ENV_MODULE,
+  createMockDiModule,
+  MOCK_ZOD_MODULE,
+  MOCK_PRISMA_DB_MODULE,
+} from "@/tests/helpers/interactor-test-setup";
+
+const mockUser = createMockUser();
+const request = vi.hoisted(() => ({ origin: "https://feat-inbox.customermates.com" }));
+
+vi.mock("@/env", () => ({
+  env: {
+    ...MOCK_ENV_MODULE.env,
+    BASE_URL: "https://customermates-git-feat-inbox-customermates.vercel.app",
+    AUTH_ALLOWED_HOSTS: ["customermates-git-feat-inbox-customermates.vercel.app", "*.customermates.com"],
+  },
+}));
+vi.mock("@/core/di", () => createMockDiModule(() => mockUser));
+vi.mock("@/core/validation/zod-error-map-server", () => MOCK_ZOD_MODULE);
+vi.mock("@/prisma/db", () => MOCK_PRISMA_DB_MODULE);
+vi.mock("next/headers", () => ({
+  headers: () => new Headers({ origin: request.origin }),
+}));
+vi.mock("next-intl/server", () => ({
+  getTranslations: () =>
+    Promise.resolve((key: string, values?: Record<string, string>) =>
+      values ? `${key} ${JSON.stringify(values)}` : key,
+    ),
+  getLocale: () => Promise.resolve("en"),
+}));
+
+import { InviteUsersByEmailInteractor } from "../invite-users-by-email.interactor";
+
+function makeInteractor(workspaceName: string | null = null) {
+  const emailService = { send: vi.fn().mockResolvedValue(true) };
+  const tokenInteractor = { invoke: vi.fn().mockResolvedValue({ ok: true, data: { token: "invite-token" } }) };
+  const companyRepo = {
+    findCompanyOrThrow: vi.fn().mockResolvedValue({
+      id: mockUser.companyId,
+      name: workspaceName,
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    }),
+  };
+
+  return {
+    emailService,
+    interactor: new InviteUsersByEmailInteractor(emailService as never, tokenInteractor as never, companyRepo),
+  };
+}
+
+describe("InviteUsersByEmailInteractor", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    request.origin = "https://feat-inbox.customermates.com";
+  });
+
+  it("uses the validated vanity origin in invitation emails", async () => {
+    const { emailService, interactor } = makeInteractor();
+
+    await interactor.invoke({ emails: ["new.member@example.com"] });
+
+    const message = emailService.send.mock.calls[0][0];
+    expect(message.react.props.inviteLink).toBe("https://feat-inbox.customermates.com/invitation/invite-token");
+  });
+
+  it("falls back to the stable branch origin for an untrusted request origin", async () => {
+    request.origin = "https://attacker.example";
+    const { emailService, interactor } = makeInteractor();
+
+    await interactor.invoke({ emails: ["new.member@example.com"] });
+
+    const message = emailService.send.mock.calls[0][0];
+    expect(message.react.props.inviteLink).toBe(
+      "https://customermates-git-feat-inbox-customermates.vercel.app/invitation/invite-token",
+    );
+  });
+
+  it("normalizes and deduplicates recipient addresses before sending", async () => {
+    const { emailService, interactor } = makeInteractor();
+
+    const result = await interactor.invoke({
+      emails: ["NEW.MEMBER@example.com", "new.member@example.com", "second.member@example.com"],
+    });
+
+    expect(result).toEqual({ ok: true, data: { sent: 2, failed: 0, failedEmails: [] } });
+    expect(emailService.send).toHaveBeenCalledTimes(2);
+    expect(emailService.send.mock.calls.map(([message]) => message.to)).toEqual([
+      "new.member@example.com",
+      "second.member@example.com",
+    ]);
+  });
+
+  it("counts the invitations the email service did not accept instead of reporting them as sent", async () => {
+    const { emailService, interactor } = makeInteractor();
+    emailService.send.mockImplementation(({ to }: { to: string }) => Promise.resolve(to !== "rejected@example.com"));
+
+    const result = await interactor.invoke({ emails: ["accepted@example.com", "rejected@example.com"] });
+
+    expect(result).toEqual({ ok: true, data: { sent: 1, failed: 1, failedEmails: ["rejected@example.com"] } });
+  });
+
+  it("sends each invitation with its own deduplication key, the same when the invitation is sent again", async () => {
+    const { emailService, interactor } = makeInteractor();
+
+    await interactor.invoke({ emails: ["first@example.com", "second@example.com"] });
+    await interactor.invoke({ emails: ["FIRST@example.com"] });
+
+    const keys = emailService.send.mock.calls.map(([message]) => message.deduplicationKey as string);
+    expect(keys[0]).toMatch(/^company-invite\/[0-9a-f]{64}$/u);
+    expect(keys[1]).not.toBe(keys[0]);
+    expect(keys[2]).toBe(keys[0]);
+  });
+
+  it("sends an invitation again under a new deduplication key once the workspace is renamed", async () => {
+    const before = makeInteractor("Taxes");
+    const after = makeInteractor("Tax office");
+
+    await before.interactor.invoke({ emails: ["first@example.com"] });
+    await after.interactor.invoke({ emails: ["first@example.com"] });
+
+    expect(after.emailService.send.mock.calls[0][0].deduplicationKey).not.toBe(
+      before.emailService.send.mock.calls[0][0].deduplicationKey,
+    );
+  });
+
+  it("names the workspace in the subject, preview and introduction when it has a name", async () => {
+    const { emailService, interactor } = makeInteractor("Taxes");
+
+    await interactor.invoke({ emails: ["new.member@example.com"] });
+
+    const message = emailService.send.mock.calls[0][0];
+    const inviterName = `${mockUser.firstName} ${mockUser.lastName}`.trim();
+    expect(message.subject).toBe(`CompanyInvite.subjectNamed ${JSON.stringify({ workspace: "Taxes" })}`);
+    expect(message.react.props.preview).toBe(
+      `CompanyInvite.previewNamed ${JSON.stringify({ inviterName, workspace: "Taxes" })}`,
+    );
+    expect(message.react.props.intro).toBe(
+      `CompanyInvite.introNamed ${JSON.stringify({ inviterName, workspace: "Taxes" })}`,
+    );
+  });
+
+  it("keeps the team wording for a workspace without a name", async () => {
+    const { emailService, interactor } = makeInteractor(null);
+
+    await interactor.invoke({ emails: ["new.member@example.com"] });
+
+    const message = emailService.send.mock.calls[0][0];
+    expect(message.subject).toBe("CompanyInvite.subject");
+    expect(message.react.props.intro).toContain("CompanyInvite.intro");
+  });
+});
