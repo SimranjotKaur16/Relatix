@@ -1,0 +1,48 @@
+import { action, makeObservable, observable, runInAction } from "mobx";
+
+import type { RecordChoicesInput, RecordChoicesResult } from "@/features/records/get-record-choices.interactor";
+
+import { getRecordChoicesAction } from "@/app/[locale]/(protected)/w/[workspace]/records/actions";
+import { reportApplicationError } from "@/core/errors/report-application-error";
+import { notifyIfWorkspaceChanged } from "@/core/errors/workspace-changed-notice";
+
+type RecordChoicesResponse = { key: string; data: RecordChoicesResult | null; failed: boolean };
+
+export function recordChoicesKey(input: RecordChoicesInput, attempt: number) {
+  return JSON.stringify([input, attempt]);
+}
+
+export class RecordChoicesStore {
+  response: RecordChoicesResponse | null = null;
+  private requestKey: string | null = null;
+
+  constructor() {
+    makeObservable(this, { response: observable.ref, load: action, cancel: action });
+  }
+
+  read(key: string | null) {
+    const current = key !== null && this.response?.key === key ? this.response : null;
+    return { data: current?.data, failed: current?.failed ?? false, loading: key !== null && current === null };
+  }
+
+  load = async (key: string, input: RecordChoicesInput) => {
+    this.requestKey = key;
+    try {
+      const result = await getRecordChoicesAction(JSON.parse(JSON.stringify(input)) as RecordChoicesInput);
+      if (notifyIfWorkspaceChanged(result)) return;
+      runInAction(() => {
+        if (this.requestKey === key) this.response = { key, data: result.ok ? result.data : null, failed: !result.ok };
+      });
+    } catch (error) {
+      if (notifyIfWorkspaceChanged(error) || this.requestKey !== key) return;
+      reportApplicationError(error);
+      runInAction(() => {
+        this.response = { key, data: null, failed: true };
+      });
+    }
+  };
+
+  cancel = () => {
+    this.requestKey = null;
+  };
+}
