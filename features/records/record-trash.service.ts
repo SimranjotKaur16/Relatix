@@ -1,0 +1,299 @@
+import { unwindFailure } from "@/core/validation/failure-unwind";
+import { randomUUID } from "node:crypto";
+import { z } from "zod";
+import type { RecordAccessPolicy } from "./record-access";
+import type { RecordRepo, RecordTrashItem } from "./record.repo";
+import type { RecordModel, RecordRef } from "./record-model.schema";
+import type { RecordJournal } from "./record-journal";
+import type { RecordEventPayload } from "./record-event.schema";
+
+import { CustomErrorCode } from "@/core/validation/validation.types";
+import type { RecordCalculationService } from "./record-calculation.service";
+import { recordKey, SYNCHRONOUS_RECORD_LIMIT } from "./record-calculation.service";
+import { recordInvariant } from "./record-invariant";
+
+type Policy = Awaited<ReturnType<RecordAccessPolicy["load"]>>;
+type TrashedLink = Awaited<ReturnType<RecordRepo["getTrashedLinksCompanyWide"]>>[number];
+
+type RecordRestoreBlocker = {
+  itemId: string;
+  reason: "listDeleted" | "parentDeleted" | "notFound";
+  typeId: string;
+  parent?: RecordRef;
+};
+type RecordRestoreResult = {
+  restoredItemIds: string[];
+  blocked: RecordRestoreBlocker[];
+  restoredRecords: number;
+  droppedLinks: number;
+};
+
+const TrashedRecordPayloadSchema = z.object({ droppedLinks: z.number().int().nonnegative() });
+
+export function droppedLinksOf(item: RecordTrashItem): number {
+  const payload = TrashedRecordPayloadSchema.safeParse(item.payload);
+  return payload.success ? payload.data.droppedLinks : 0;
+}
+
+function subLists(model: RecordModel): Array<{ typeId: string; relationId: string }> {
+  return model.types.flatMap((type) =>
+    type.parentRelationshipId ? [{ typeId: type.id, relationId: type.parentRelationshipId }] : [],
+  );
+}
+
+function parentRelationIds(model: RecordModel): string[] {
+  return subLists(model).map((entry) => entry.relationId);
+}
+
+function deletedPermanentlyPayload(
+  ref: RecordRef,
+  model: RecordModel,
+  cause: RecordEventPayload["cause"],
+): RecordEventPayload {
+  return {
+    ref,
+    schemaRevision: model.revision,
+    cause,
+    beforeVersion: null,
+    afterVersion: null,
+    changedFieldIds: [],
+    fields: [],
+    assignments: null,
+    identities: null,
+    links: [],
+  };
+}
+
+export class RecordTrashService {
+  constructor(
+    private records: RecordRepo,
+    private calculations: RecordCalculationService,
+  ) {}
+
+  async accessible(item: RecordTrashItem, model: RecordModel, policy: Policy): Promise<RecordRestoreBlocker | null> {
+    const type = model.types.find((candidate) => candidate.id === item.typeId);
+    if (!type || type.archived) return { itemId: item.id, reason: "listDeleted", typeId: item.typeId };
+    const ref = { typeId: item.typeId, recordId: item.targetId };
+    const row = await this.records.getRecordCompanyWide(ref, { includeTrash: true });
+    const members = await this.records.countTrashedRecordsCompanyWide([item.id]);
+    if (!row || !members.records.every((entry) => policy.allowed(entry.typeId, "delete")))
+      return { itemId: item.id, reason: "notFound", typeId: item.typeId };
+    if (type.parentRelationshipId) {
+      const parentRef = await this.records.getTrashedParentCompanyWide(ref, type.parentRelationshipId);
+      if (!parentRef || !(await this.records.getRecordCompanyWide(parentRef))) {
+        return {
+          itemId: item.id,
+          reason: "parentDeleted",
+          typeId: item.typeId,
+          ...(parentRef ? { parent: parentRef } : {}),
+        };
+      }
+    }
+    return (await policy.canRead(row)) ? null : { itemId: item.id, reason: "notFound", typeId: item.typeId };
+  }
+
+  async prepareSubListRows(
+    item: RecordTrashItem,
+    model: RecordModel,
+    records = this.records,
+  ): Promise<RecordTrashItem> {
+    const rows = await records.getTrashedSubListRowsCompanyWide(item.id, subLists(model));
+    const destinations = new Map<string, string>();
+    for (let moved = true; moved; ) {
+      moved = false;
+      for (const row of rows) {
+        if (!row.parent || destinations.has(recordKey(row.ref))) continue;
+        const destination =
+          row.parent.trashItemId && row.parent.trashItemId !== item.id
+            ? row.parent.trashItemId
+            : destinations.get(recordKey(row.parent.ref));
+        if (!destination) continue;
+        destinations.set(recordKey(row.ref), destination);
+        moved = true;
+      }
+    }
+    for (const destination of new Set(destinations.values())) {
+      await records.reassignTrashedRecordsCompanyWide(
+        rows.filter((row) => destinations.get(recordKey(row.ref)) === destination).map((row) => row.ref),
+        destination,
+      );
+    }
+    const orphans = rows.filter((row) => !row.parent).map((row) => row.ref);
+    if (!orphans.length) return item;
+    const purge = randomUUID();
+    await records.reassignTrashedRecordsCompanyWide(orphans, purge);
+    await purgeRecordTrashItems(records, [purge], model, null, purge, { kind: "system" });
+    return (await records.getRecordTrashItemsCompanyWide({ ids: [item.id] }))[0] ?? item;
+  }
+
+  async restore(
+    items: RecordTrashItem[],
+    model: RecordModel,
+    policy: Policy,
+    journal: RecordJournal,
+    limit = SYNCHRONOUS_RECORD_LIMIT,
+  ): Promise<RecordRestoreResult> {
+    const result: RecordRestoreResult = { restoredItemIds: [], blocked: [], restoredRecords: 0, droppedLinks: 0 };
+    let pending = items;
+    let waitingOnParent: RecordRestoreBlocker[] = [];
+    let progressed = true;
+    while (pending.length && progressed) {
+      progressed = false;
+      const waiting: RecordTrashItem[] = [];
+      waitingOnParent = [];
+      for (const item of pending) {
+        const blocker = await this.accessible(item, model, policy);
+        if (blocker?.reason === "parentDeleted") {
+          waiting.push(item);
+          waitingOnParent.push(blocker);
+          continue;
+        }
+        if (blocker) {
+          result.blocked.push(blocker);
+          continue;
+        }
+        const current = await this.prepareSubListRows(item, model, journal.repository);
+        const refs = await journal.repository.getTrashedRecordRefsCompanyWide(
+          [item.id],
+          limit - result.restoredRecords + 1,
+        );
+        if (result.restoredRecords + refs.length > limit)
+          throw unwindFailure(CustomErrorCode.recordCalculationBudget, "conflict");
+        result.droppedLinks += (await this.restoreRecords(refs, model, journal, limit)) + droppedLinksOf(current);
+        await journal.repository.removeTrashItems([item.id]);
+        result.restoredItemIds.push(item.id);
+        result.restoredRecords += refs.length;
+        progressed = true;
+      }
+      pending = waiting;
+    }
+    result.blocked.push(...waitingOnParent);
+    return result;
+  }
+
+  async restoreRecords(refs: RecordRef[], model: RecordModel, journal: RecordJournal, limit: number) {
+    const records = journal.repository;
+    await journal.prepareRestore(refs);
+    await records.restoreRecords(refs);
+    const restored = new Set(refs.map(recordKey));
+    const seeds = new Map(refs.map((ref) => [recordKey(ref), ref]));
+    const links = await records.getTrashedLinksCompanyWide(refs, limit * 4 + 1);
+    if (links.length > limit * 4) throw unwindFailure(CustomErrorCode.recordCalculationBudget, "conflict");
+    const restoring = await this.restorableLinks(records, model, links, restored);
+    await journal.restoreLinks(restoring.restored);
+    for (const link of restoring.restored) {
+      seeds.set(recordKey(link.source), link.source);
+      seeds.set(recordKey(link.target), link.target);
+      if (seeds.size > limit) throw unwindFailure(CustomErrorCode.recordCalculationBudget, "conflict");
+    }
+    const droppedLinks = restoring.dropped;
+    const recalculated = await this.calculations
+      .withRepository(records)
+      .recalculate(model, [...seeds.values()], new Map(), limit);
+    if (!recalculated.complete) throw unwindFailure(CustomErrorCode.recordCalculationBudget, "conflict");
+    for (const ref of recalculated.changed) seeds.set(recordKey(ref), ref);
+    for (const [key, ref] of seeds) if (!restored.has(key)) await records.touch(ref);
+    return droppedLinks;
+  }
+
+  private async restorableLinks(
+    records: RecordRepo,
+    model: RecordModel,
+    links: TrashedLink[],
+    restored: ReadonlySet<string>,
+  ): Promise<{ restored: TrashedLink[]; dropped: number }> {
+    const endpoints = [
+      ...new Map(
+        links.flatMap((link) => [link.source, link.target]).map((ref) => [recordKey(ref), ref] as const),
+      ).values(),
+    ].filter((ref) => !restored.has(recordKey(ref)));
+    const live = new Set(restored);
+    for (let offset = 0; offset < endpoints.length; offset += 500) {
+      for (const row of await records.getRecordsCompanyWide(endpoints.slice(offset, offset + 500)))
+        live.add(recordKey({ typeId: row.typeId, recordId: row.id }));
+    }
+    const candidates = links.filter((link) => live.has(recordKey(link.source)) && live.has(recordKey(link.target)));
+    const taken = new Set<string>();
+    const side = (relationId: string, direction: "outgoing" | "incoming", ref: RecordRef) =>
+      `${relationId}|${direction}|${recordKey(ref)}`;
+    const singles = new Map<string, { relationId: string; direction: "outgoing" | "incoming"; refs: RecordRef[] }>();
+    for (const link of candidates) {
+      const relation = model.relationships.find((candidate) => candidate.id === link.relationId);
+      if (!relation || relation.archived) continue;
+      for (const [cardinality, direction, ref] of [
+        [relation.sourceCardinality, "outgoing", link.source],
+        [relation.targetCardinality, "incoming", link.target],
+      ] as const) {
+        if (cardinality !== "one") continue;
+        const group = singles.get(`${link.relationId}|${direction}`) ?? {
+          relationId: link.relationId,
+          direction,
+          refs: [],
+        };
+        group.refs.push(ref);
+        singles.set(`${link.relationId}|${direction}`, group);
+      }
+    }
+    for (const { relationId, direction, refs } of singles.values()) {
+      for (const entry of await records.linkedRecordsManyCompanyWide(refs, relationId, direction, 1))
+        if (entry.linked.length) taken.add(side(relationId, direction, entry.ref));
+    }
+    const result: TrashedLink[] = [];
+    const dropped: TrashedLink[] = [];
+    for (const link of candidates) {
+      const relation = model.relationships.find((candidate) => candidate.id === link.relationId);
+      const single = relation && !relation.archived;
+      const conflicting =
+        single &&
+        ((relation.sourceCardinality === "one" && taken.has(side(link.relationId, "outgoing", link.source))) ||
+          (relation.targetCardinality === "one" && taken.has(side(link.relationId, "incoming", link.target))));
+      if (conflicting) {
+        dropped.push(link);
+        continue;
+      }
+      result.push(link);
+      taken.add(side(link.relationId, "outgoing", link.source));
+      taken.add(side(link.relationId, "incoming", link.target));
+    }
+    if (dropped.length) await records.dropTrashedLinks(dropped);
+    if (result.length) await records.restoreLinks(result);
+    return { restored: result, dropped: dropped.length };
+  }
+
+  purgedAlong(itemIds: string[], model: RecordModel): Promise<{ itemIds: string[]; refs: RecordRef[] }> {
+    return this.records.getTrashPurgedAlongCompanyWide(itemIds, parentRelationIds(model));
+  }
+
+  purge(
+    itemIds: string[],
+    model: RecordModel,
+    actorId: string | null,
+    causeId: string,
+    cause: RecordEventPayload["cause"],
+  ): Promise<RecordRef[]> {
+    return purgeRecordTrashItems(this.records, itemIds, model, actorId, causeId, cause);
+  }
+}
+
+export async function purgeRecordTrashItems(
+  records: RecordRepo,
+  itemIds: string[],
+  model: RecordModel,
+  actorId: string | null,
+  causeId: string,
+  cause: RecordEventPayload["cause"],
+): Promise<RecordRef[]> {
+  const along = await records.getTrashPurgedAlongCompanyWide(itemIds, parentRelationIds(model));
+  if (along.refs.length) await records.reassignTrashedRecordsCompanyWide(along.refs, recordInvariant(itemIds[0]));
+  const refs = await records.purgeTrashItems([...itemIds, ...along.itemIds]);
+  for (const ref of refs) {
+    await records.appendEvent(
+      ref,
+      actorId,
+      causeId,
+      "record.deletedPermanently",
+      deletedPermanentlyPayload(ref, model, cause),
+    );
+  }
+  return refs;
+}
