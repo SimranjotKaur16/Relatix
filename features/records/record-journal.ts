@@ -1,0 +1,516 @@
+import { unwindFailure } from "@/core/validation/failure-unwind";
+import { CustomErrorCode } from "@/core/validation/validation.types";
+import type { RecordEventAppend, RecordRepo } from "./record.repo";
+import { recordChannelsField } from "./record-channels";
+import type { RecordField, RecordModel, RecordRef } from "./record-model.schema";
+import type { RecordEventPayload, RecordHistorySnapshot, RecordJournalEntry } from "./record-event.schema";
+
+import { RecordJournalEntrySchema } from "./record-event.schema";
+import { compareRecordKey } from "./record-json";
+import { calculationDependencyHash } from "./configuration.service";
+import { expressionFieldDependencies } from "./record-model-validation";
+import { recordKey, SYNCHRONOUS_RECORD_LIMIT } from "./record-calculation.service";
+import { decodeRecordValue } from "./record-storage";
+import { recordInvariant } from "./record-invariant";
+
+export function historyPublications(field: RecordField, model: RecordModel) {
+  const publications = new Map<string, { fieldId: string; dependencyHash: string }>();
+  const visited = new Set<string>();
+  const visit = (definition: RecordField) => {
+    if (visited.has(definition.id)) return;
+    visited.add(definition.id);
+    if (definition.id !== field.id && definition.publishedSummary) {
+      publications.set(definition.id, {
+        fieldId: definition.id,
+        dependencyHash: calculationDependencyHash(definition, model),
+      });
+      return;
+    }
+    if (definition.behavior.kind === "input") return;
+    for (const id of expressionFieldDependencies(definition.behavior.expression)) {
+      const dependency = model.fields.find((candidate) => candidate.id === id);
+      if (dependency) visit(dependency);
+    }
+  };
+  visit(field);
+  return [...publications.values()].sort((a, b) => compareRecordKey(a.fieldId, b.fieldId));
+}
+
+function snapshotOf(
+  row: NonNullable<Awaited<ReturnType<RecordRepo["getRecordCompanyWide"]>>>,
+  dependencies: Map<string, RecordRef[]>,
+  identities: Awaited<ReturnType<RecordRepo["getIdentitiesCompanyWide"]>>,
+  model: RecordModel,
+  fileNames: ReadonlyMap<string, string>,
+): RecordHistorySnapshot {
+  const fileFieldIds = new Set(
+    model.fields.filter((field) => field.typeId === row.typeId && field.valueType === "file").map((field) => field.id),
+  );
+  return {
+    version: row.version,
+    assignedUserIds: row.assignments.map((assignment) => assignment.userId).sort(),
+    values: model.fields
+      .filter((field) => field.typeId === row.typeId && row.values.some((value) => value.fieldId === field.id))
+      .sort((a, b) => compareRecordKey(a.id, b.id))
+      .map((field) => ({
+        fieldId: field.id,
+        label: field.label,
+        valueType: field.valueType,
+        format: field.format,
+        options: field.options,
+        value: decodeRecordValue(
+          row.values.find((value) => value.fieldId === field.id),
+          field,
+        ),
+        ...(fileFieldIds.has(field.id)
+          ? {
+              files: (row.values.find((value) => value.fieldId === field.id)?.textListValue ?? []).map((id) => ({
+                id,
+                name: fileNames.get(id) ?? id,
+              })),
+            }
+          : {}),
+        sources: (dependencies.get(field.id) ?? []).sort((a, b) => compareRecordKey(recordKey(a), recordKey(b))),
+        publications: historyPublications(field, model),
+        dependencyHash: calculationDependencyHash(field, model),
+        publishedSummary: field.publishedSummary,
+      })),
+    identities: identities
+      .map(({ id, provider, value, messagingId, displayName, profileUrl }) => ({
+        id,
+        provider,
+        value,
+        messagingId,
+        displayName,
+        profileUrl,
+      }))
+      .sort((a, b) => compareRecordKey(a.id, b.id)),
+  };
+}
+
+async function snapshot(
+  records: RecordRepo,
+  ref: RecordRef,
+  model: RecordModel,
+): Promise<RecordHistorySnapshot | null> {
+  const row = await records.getRecordCompanyWide(ref);
+  if (!row) return null;
+  const dependencies = new Map(
+    (await records.getRecordDependenciesCompanyWide(ref)).map((entry) => [entry.fieldId, entry.sources]),
+  );
+  const identities = recordChannelsField(model, ref.typeId) ? await records.getIdentitiesCompanyWide(ref) : [];
+  const fileFieldIds = new Set(model.fields.filter((field) => field.valueType === "file").map((field) => field.id));
+  const fileNames = new Map(
+    (
+      await records.getRecordFilesCompanyWide(
+        row.values.flatMap((value) =>
+          fileFieldIds.has(value.fieldId) && value.state === "value" ? value.textListValue : [],
+        ),
+      )
+    ).map((file) => [file.id, file.name]),
+  );
+  return snapshotOf(row, dependencies, identities, model, fileNames);
+}
+
+const SNAPSHOT_CHUNK = 500;
+
+async function snapshots(
+  records: RecordRepo,
+  refs: RecordRef[],
+  model: RecordModel,
+): Promise<Map<string, RecordHistorySnapshot | null>> {
+  const rows = new Map<string, NonNullable<Awaited<ReturnType<RecordRepo["getRecordCompanyWide"]>>>>();
+  for (let offset = 0; offset < refs.length; offset += SNAPSHOT_CHUNK) {
+    for (const row of await records.getRecordsCompanyWide(refs.slice(offset, offset + SNAPSHOT_CHUNK)))
+      rows.set(recordKey({ typeId: row.typeId, recordId: row.id }), row);
+  }
+  const live = refs.filter((ref) => rows.has(recordKey(ref)));
+  const dependencies = new Map(
+    (live.length ? await records.getRecordDependenciesManyCompanyWide(live) : []).map((entry) => [
+      recordKey(entry.ref),
+      new Map(entry.dependencies.map((dependency) => [dependency.fieldId, dependency.sources])),
+    ]),
+  );
+  const identities = new Map<string, Awaited<ReturnType<RecordRepo["getIdentitiesCompanyWide"]>>>();
+  for (const typeId of new Set(live.map((ref) => ref.typeId))) {
+    if (!recordChannelsField(model, typeId)) continue;
+    const recordIds = live.filter((ref) => ref.typeId === typeId).map((ref) => ref.recordId);
+    for (let offset = 0; offset < recordIds.length; offset += SNAPSHOT_CHUNK) {
+      const found = await records.getRecordIdentitiesCompanyWide(
+        typeId,
+        recordIds.slice(offset, offset + SNAPSHOT_CHUNK),
+      );
+      for (const [recordId, entries] of found) identities.set(recordKey({ typeId, recordId }), entries);
+    }
+  }
+  const fileFieldIds = new Set(model.fields.filter((field) => field.valueType === "file").map((field) => field.id));
+  const fileIds = [
+    ...new Set(
+      [...rows.values()].flatMap((row) =>
+        row.values.flatMap((value) =>
+          fileFieldIds.has(value.fieldId) && value.state === "value" ? value.textListValue : [],
+        ),
+      ),
+    ),
+  ];
+  const fileNames = new Map<string, string>();
+  for (let offset = 0; offset < fileIds.length; offset += SNAPSHOT_CHUNK) {
+    for (const file of await records.getRecordFilesCompanyWide(fileIds.slice(offset, offset + SNAPSHOT_CHUNK)))
+      fileNames.set(file.id, file.name);
+  }
+  const result = new Map<string, RecordHistorySnapshot | null>();
+  for (const ref of refs) {
+    const row = rows.get(recordKey(ref));
+    result.set(
+      recordKey(ref),
+      row
+        ? snapshotOf(
+            row,
+            dependencies.get(recordKey(ref)) ?? new Map(),
+            identities.get(recordKey(ref)) ?? [],
+            model,
+            fileNames,
+          )
+        : null,
+    );
+  }
+  return result;
+}
+
+export function recordEventChanges(
+  entry: RecordJournalEntry,
+  after: RecordHistorySnapshot | null,
+  model: RecordModel,
+  cause: RecordEventPayload["cause"],
+): {
+  kind: "record.created" | "record.updated" | "record.deleted" | "record.restored";
+  payload: RecordEventPayload;
+} | null {
+  const before = entry.before;
+  if (!before && !after) return null;
+  const previous = new Map(before?.values.map((field) => [field.fieldId, field]) ?? []);
+  const current = new Map(after?.values.map((field) => [field.fieldId, field]) ?? []);
+  const order = new Map(model.fields.map((field) => [field.id, field.position]));
+  const fields = [...new Set([...previous.keys(), ...current.keys()])]
+    .sort((a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0) || compareRecordKey(a, b))
+    .map((fieldId) => ({
+      fieldId,
+      before: previous.get(fieldId) ?? null,
+      after: current.get(fieldId) ?? null,
+    }))
+    .filter((change) => {
+      if (
+        (!change.before || change.before.value.state === "missing") &&
+        (!change.after || change.after.value.state === "missing")
+      )
+        return false;
+      return JSON.stringify(change.before) !== JSON.stringify(change.after);
+    });
+  const assignments = {
+    before: before?.assignedUserIds ?? [],
+    after: after?.assignedUserIds ?? [],
+  };
+  const identities = {
+    before: before?.identities ?? [],
+    after: after?.identities ?? [],
+  };
+  const links = entry.links.filter((link) => link.before !== link.after);
+  const assignmentsChanged = JSON.stringify(assignments.before) !== JSON.stringify(assignments.after);
+  const identitiesChanged = JSON.stringify(identities.before) !== JSON.stringify(identities.after);
+  const channelsFieldId = identitiesChanged ? recordChannelsField(model, entry.ref.typeId)?.id : undefined;
+  if (before && after && !fields.length && !links.length && !assignmentsChanged && !identitiesChanged) return null;
+  return {
+    kind: !before ? "record.created" : !after ? "record.deleted" : "record.updated",
+    payload: {
+      ref: entry.ref,
+      schemaRevision: model.revision,
+      cause,
+      beforeVersion: before?.version ?? null,
+      afterVersion: after?.version ?? null,
+      changedFieldIds: [...fields.map((change) => change.fieldId), ...(channelsFieldId ? [channelsFieldId] : [])],
+      fields,
+      assignments: assignmentsChanged ? assignments : null,
+      identities: identitiesChanged ? identities : null,
+      links,
+    },
+  };
+}
+
+export class RecordJournal {
+  readonly repository: RecordRepo;
+  private entries = new Map<string, RecordJournalEntry>();
+  private emittedDeletions = new Set<string>();
+  private restored = new Set<string>();
+  private dirty = new Set<string>();
+
+  constructor(
+    private records: RecordRepo,
+    private previous: RecordModel,
+    private limit = SYNCHRONOUS_RECORD_LIMIT,
+    private staging?: { base: RecordRepo; operationId: string },
+  ) {
+    const overrides: Partial<RecordRepo> = {
+      create: async (ref, assignedUserIds) => {
+        await this.capture(ref);
+        await records.create(ref, assignedUserIds);
+      },
+      touch: async (ref) => {
+        await this.capture(ref);
+        await records.touch(ref);
+      },
+      setValue: async (ref, fieldId, result, revision) => {
+        await this.capture(ref);
+        await records.setValue(ref, fieldId, result, revision);
+      },
+      setValues: async (values) => {
+        await this.captureMany(values.map((value) => value.ref));
+        await records.setValues(values);
+      },
+      setValueDependencies: async (ref, fieldId, sources) => {
+        await this.capture(ref);
+        await records.setValueDependencies(ref, fieldId, sources);
+      },
+      setValueDependenciesMany: async (dependencies) => {
+        await this.captureMany(dependencies.map((dependency) => dependency.ref));
+        await records.setValueDependenciesMany(dependencies);
+      },
+      setAssignments: async (ref, userIds) => {
+        await this.capture(ref);
+        await records.setAssignments(ref, userIds);
+      },
+      setIdentities: async (ref, identities) => {
+        await this.capture(ref);
+        await records.setIdentities(ref, identities);
+      },
+      link: async (relationId, source, target) => {
+        await this.linkChange(relationId, source, target, true);
+        await records.link(relationId, source, target);
+      },
+      unlink: async (relationId, source, target) => {
+        await this.linkChange(relationId, source, target, false);
+        await records.unlink(relationId, source, target);
+      },
+      delete: async (ref) => {
+        await this.capture(ref);
+        const links = await records.getLinksCompanyWide(ref, limit * 4 + 1);
+        if (links.length > limit * 4) throw unwindFailure(CustomErrorCode.recordCalculationBudget, "conflict");
+        for (const link of links) await this.linkChange(link.relationId, link.source, link.target, false, true);
+        await records.delete(ref);
+      },
+      moveToTrash: async (ref, trashItemId) => {
+        await this.capture(ref);
+        const links = await records.getLinksCompanyWide(ref, limit * 4 + 1);
+        if (links.length > limit * 4) throw unwindFailure(CustomErrorCode.recordCalculationBudget, "conflict");
+        for (const link of links) await this.linkChange(link.relationId, link.source, link.target, false, true);
+        await records.moveToTrash(ref, trashItemId);
+      },
+    };
+    this.repository = new Proxy(records, {
+      get(target, property) {
+        const key = property as keyof RecordRepo;
+        if (key in overrides) return overrides[key];
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  }
+
+  private markDirty(entry: RecordJournalEntry): void {
+    if (this.staging) this.dirty.add(recordKey(entry.ref));
+  }
+
+  async persist(): Promise<void> {
+    if (!this.staging) return;
+    await this.staging.base.stageRows(
+      this.staging.operationId,
+      "journal",
+      [...this.dirty].map((key) => ({ key, payload: recordInvariant(this.entries.get(key)) })),
+    );
+    this.dirty.clear();
+  }
+
+  async stageDeletion(ref: RecordRef, trashItemId: string): Promise<void> {
+    if (!this.staging) throw new Error("A staged deletion requires a staged journal");
+    await this.capture(ref);
+    await this.records.moveToTrash(ref, trashItemId);
+  }
+
+  async prepareRestore(refs: RecordRef[]): Promise<void> {
+    await this.captureMany(refs);
+    for (const ref of refs) this.restored.add(recordKey(ref));
+  }
+
+  async restoreLinks(links: Array<{ relationId: string; source: RecordRef; target: RecordRef }>): Promise<void> {
+    await this.captureMany(links.flatMap((link) => [link.source, link.target]));
+    for (const link of links) await this.linkChange(link.relationId, link.source, link.target, true, false);
+  }
+
+  async stageDeletedLink(link: { relationId: string; source: RecordRef; target: RecordRef }): Promise<void> {
+    if (!this.staging) throw new Error("A staged deletion requires a staged journal");
+    await this.linkChange(link.relationId, link.source, link.target, false, true);
+  }
+
+  private async capture(ref: RecordRef): Promise<RecordJournalEntry> {
+    const key = recordKey(ref);
+    const existing = this.entries.get(key);
+    if (existing) return existing;
+    if (this.entries.size >= this.limit) throw unwindFailure(CustomErrorCode.recordCalculationBudget, "conflict");
+    const saved = this.staging ? await this.staging.base.getStageRow(this.staging.operationId, "journal", key) : null;
+    const entry = saved
+      ? RecordJournalEntrySchema.parse(saved)
+      : {
+          ref,
+          before: await snapshot(this.records, ref, this.previous),
+          links: [],
+        };
+    this.entries.set(key, entry);
+    if (!saved) this.markDirty(entry);
+    return entry;
+  }
+
+  private async captureMany(refs: RecordRef[]): Promise<void> {
+    const pending = [...new Map(refs.map((ref) => [recordKey(ref), ref])).values()].filter(
+      (ref) => !this.entries.has(recordKey(ref)),
+    );
+    if (pending.length <= 1) {
+      for (const ref of pending) await this.capture(ref);
+      return;
+    }
+    const saved = this.staging
+      ? new Map(
+          (await this.staging.base.getStageRowsByKeys(this.staging.operationId, "journal", pending.map(recordKey))).map(
+            (row) => [row.key, row.payload],
+          ),
+        )
+      : new Map<string, unknown>();
+    const fresh = pending.filter((ref) => !saved.has(recordKey(ref)));
+    const before = fresh.length ? await snapshots(this.records, fresh, this.previous) : new Map();
+    for (const ref of pending) {
+      const key = recordKey(ref);
+      if (this.entries.size >= this.limit) throw unwindFailure(CustomErrorCode.recordCalculationBudget, "conflict");
+      const stored = saved.get(key);
+      const entry = stored
+        ? RecordJournalEntrySchema.parse(stored)
+        : { ref, before: before.get(key) ?? null, links: [] };
+      this.entries.set(key, entry);
+      if (!stored) this.markDirty(entry);
+    }
+  }
+
+  private async linkChange(
+    relationId: string,
+    source: RecordRef,
+    target: RecordRef,
+    after: boolean,
+    existing?: boolean,
+  ): Promise<void> {
+    const before =
+      existing ??
+      (await this.records.linkedRecordsCompanyWide(source, relationId, "outgoing", this.limit * 4 + 1)).some(
+        (ref) => recordKey(ref) === recordKey(target),
+      );
+    for (const ref of [source, target]) {
+      const entry = await this.capture(ref);
+      const found = entry.links.find(
+        (link) =>
+          link.relationId === relationId &&
+          recordKey(link.source) === recordKey(source) &&
+          recordKey(link.target) === recordKey(target),
+      );
+      if (found) found.after = after;
+      else entry.links.push({ relationId, source, target, before, after });
+      this.markDirty(entry);
+    }
+  }
+
+  async prepareDeletion(
+    refs: RecordRef[],
+    model: RecordModel,
+    actorId: string | null,
+    causeId: string,
+    cause: RecordEventPayload["cause"],
+  ): Promise<void> {
+    if (this.staging) throw new Error("Staged deletion matches are captured during publication");
+    for (const ref of refs) await this.capture(ref);
+    for (const ref of refs) {
+      const links = await this.records.getLinksCompanyWide(ref, this.limit * 4 + 1);
+      if (links.length > this.limit * 4) throw unwindFailure(CustomErrorCode.recordCalculationBudget, "conflict");
+      for (const link of links) await this.linkChange(link.relationId, link.source, link.target, false, true);
+    }
+    for (const ref of refs) {
+      const entry = this.entries.get(recordKey(ref));
+      if (!entry) throw new Error("A deletion requires its original record snapshot");
+      const event = recordEventChanges(entry, null, model, cause);
+      if (!event) continue;
+      await this.records.appendEvent(ref, actorId, causeId, event.kind, event.payload, true);
+      this.emittedDeletions.add(recordKey(ref));
+    }
+  }
+
+  async flush(
+    model: RecordModel,
+    actorId: string | null,
+    causeId: string,
+    cause: RecordEventPayload["cause"],
+  ): Promise<void> {
+    await this.emitAll([...this.entries.values()], model, actorId, causeId, cause);
+  }
+
+  async flushPage(
+    model: RecordModel,
+    actorId: string | null,
+    causeId: string,
+    cause: RecordEventPayload["cause"],
+    afterKey: string | undefined,
+    take: number,
+  ): Promise<{ count: number; afterKey: string | undefined }> {
+    if (!this.staging) throw new Error("A paginated journal requires a staged operation");
+    const rows = await this.staging.base.getStageRowsPage(this.staging.operationId, "journal", afterKey, take);
+    await this.emitAll(
+      rows.map((row) => RecordJournalEntrySchema.parse(row.payload)),
+      model,
+      actorId,
+      causeId,
+      cause,
+    );
+    return { count: rows.length, afterKey: rows.at(-1)?.key };
+  }
+
+  private async emitAll(
+    entries: RecordJournalEntry[],
+    model: RecordModel,
+    actorId: string | null,
+    causeId: string,
+    cause: RecordEventPayload["cause"],
+  ): Promise<void> {
+    const pending = entries.filter((entry) => !this.emittedDeletions.has(recordKey(entry.ref)));
+    const after =
+      pending.length > 1
+        ? await snapshots(
+            this.records,
+            pending.map((entry) => entry.ref),
+            model,
+          )
+        : null;
+    const events: RecordEventAppend[] = [];
+    for (const entry of pending) {
+      const snapshotAfter = after
+        ? (after.get(recordKey(entry.ref)) ?? null)
+        : await snapshot(this.records, entry.ref, model);
+      const event = recordEventChanges(entry, snapshotAfter, model, cause);
+      if (!event) continue;
+      if (event.kind === "record.created" && this.restored.has(recordKey(entry.ref))) event.kind = "record.restored";
+      if (this.staging && entry.before && snapshotAfter && snapshotAfter.version <= entry.before.version)
+        event.payload.afterVersion = entry.before.version + 1;
+      events.push({
+        ref: entry.ref,
+        actorId,
+        causeId,
+        kind: event.kind,
+        payload: event.payload,
+        publish: event.kind !== "record.updated" || cause.kind !== "configuration",
+      });
+    }
+    if (events.length) await this.records.appendEvents(events);
+  }
+}
