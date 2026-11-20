@@ -1,0 +1,567 @@
+import { z } from "zod";
+
+import type {
+  CalculationExpression,
+  RecordField,
+  RecordModel,
+  RecordScalar,
+  RecordValueType,
+} from "./record-model.schema";
+
+import { RecordDateTimeSchema } from "./record-model.schema";
+
+import { CustomErrorCode } from "@/core/validation/validation.types";
+
+import { isRepresentableDecimal } from "./calculation";
+import { recordInstantMicros } from "./record-instant";
+import { resolveRecordPath } from "./record-relationship-path";
+
+export type ModelIssue = {
+  code: string;
+  fieldId?: string;
+  typeId?: string;
+  relationId?: string;
+  viewKind?: "view" | "personalLayout";
+  viewId?: string;
+  viewName?: string;
+  columnId?: string;
+  columnLabel?: string;
+  count?: number;
+  examples?: string[];
+};
+
+export const MULTIPLE_VALUE_TYPES: readonly RecordValueType[] = ["text", "url", "select", "file"];
+export const CLICK_ACTION_VALUE_TYPES: readonly RecordValueType[] = ["url", "address", "channels"];
+
+export function isRecordNameField(field: Pick<RecordField, "archived" | "valueType" | "multiple">) {
+  return !field.archived && field.valueType === "text" && !field.multiple;
+}
+
+export function recordNameIssues(model: RecordModel, previous: RecordModel): ModelIssue[] {
+  return model.types.flatMap((type): ModelIssue[] => {
+    const field = model.fields.find((field) => field.id === type.primaryFieldId);
+    if (!field?.multiple) return [];
+    const existing = previous.types.find((candidate) => candidate.id === type.id);
+    const retained = previous.fields.find((candidate) => candidate.id === existing?.primaryFieldId);
+    return existing?.primaryFieldId === field.id && retained?.multiple
+      ? []
+      : [{ code: "invalid_primary_field", typeId: type.id, fieldId: field.id }];
+  });
+}
+
+export function becameMultiplePictureUrl(
+  field: Pick<RecordField, "archived" | "valueType" | "multiple">,
+  previous: Pick<RecordField, "valueType" | "multiple"> | undefined,
+) {
+  return (
+    field.archived &&
+    field.valueType === "url" &&
+    field.multiple &&
+    !(previous?.valueType === "url" && previous.multiple)
+  );
+}
+
+export function recordPictureIssues(
+  model: RecordModel,
+  previous: RecordModel,
+  dropped: readonly { bindingId: string; fieldId: string; role: string }[] = [],
+): ModelIssue[] {
+  const archived = model.fields.flatMap((field): ModelIssue[] =>
+    becameMultiplePictureUrl(
+      field,
+      previous.fields.find((candidate) => candidate.id === field.id),
+    ) &&
+    dropped.some(
+      (entry) =>
+        entry.fieldId === field.id &&
+        model.capabilities.some((binding) => binding.id === entry.bindingId && binding.kind === "avatar"),
+    )
+      ? [{ code: "capability_requires_field", fieldId: field.id }]
+      : [],
+  );
+  return [
+    ...archived,
+    ...model.capabilities.flatMap((binding) =>
+      binding.kind !== "avatar"
+        ? []
+        : binding.fields.flatMap((reference): ModelIssue[] => {
+            const field = model.fields.find((field) => field.id === reference.fieldId);
+            if (!field?.multiple) return [];
+            const existing = previous.fields.find((field) => field.id === reference.fieldId);
+            const retained = previous.capabilities.some(
+              (candidate) =>
+                candidate.kind === "avatar" &&
+                candidate.typeId === binding.typeId &&
+                candidate.fields.some((field) => field.fieldId === reference.fieldId && field.role === reference.role),
+            );
+            const restoring =
+              existing?.archived &&
+              !field.archived &&
+              dropped.some(
+                (entry) =>
+                  entry.bindingId === binding.id && entry.fieldId === field.id && entry.role === reference.role,
+              );
+            return existing?.multiple && (retained || restoring)
+              ? []
+              : [{ code: "capability_requires_field", fieldId: field.id }];
+          }),
+    ),
+  ];
+}
+
+export function selectedOptionIds(value: RecordScalar | null): string[] {
+  if (!value) return [];
+  if (value.kind === "select") return [value.value];
+  if (value.kind === "selectList") return value.value;
+  return [];
+}
+
+export function scalarMatchesType(value: RecordScalar, type: RecordValueType, multiple = false): boolean {
+  if (type === "file") return value.kind === "file" && (multiple || value.value.length === 1);
+  if (multiple && type === "select") return value.kind === "selectList";
+  if (multiple) {
+    return (
+      value.kind === "textList" &&
+      ["text", "url"].includes(type) &&
+      value.value.every((text) => scalarMatchesType({ kind: "text", value: text }, type))
+    );
+  }
+  switch (type) {
+    case "number":
+      return value.kind === "decimal" && value.currency === null && isRepresentableDecimal(value.value);
+    case "currency":
+      return value.kind === "decimal" && value.currency !== null && isRepresentableDecimal(value.value);
+    case "url": {
+      if (value.kind !== "text") return false;
+      try {
+        return ["http:", "https:"].includes(new URL(value.value).protocol);
+      } catch {
+        return false;
+      }
+    }
+    case "dateRange":
+    case "dateTimeRange": {
+      if (value.kind !== "range") return false;
+      const values = [value.start, value.end].filter((entry): entry is string => entry !== null);
+      const schema = type === "dateRange" ? z.union([z.iso.date(), RecordDateTimeSchema]) : RecordDateTimeSchema;
+      if (values.some((entry) => !schema.safeParse(entry).success)) return false;
+      return !value.start || !value.end || recordInstantMicros(value.start) <= recordInstantMicros(value.end);
+    }
+    default:
+      return value.kind === type;
+  }
+}
+
+const TYPE_MISMATCH_CODES: Partial<Record<RecordValueType, CustomErrorCode>> = {
+  url: CustomErrorCode.invalidUrl,
+  number: CustomErrorCode.recordNumberInvalid,
+  currency: CustomErrorCode.recordNumberInvalid,
+  date: CustomErrorCode.recordDateInvalid,
+  dateTime: CustomErrorCode.recordDateInvalid,
+  dateRange: CustomErrorCode.recordDateRangeInvalid,
+  dateTimeRange: CustomErrorCode.recordDateRangeInvalid,
+  select: CustomErrorCode.recordOptionInvalid,
+};
+
+export function recordValueIssue(
+  value: RecordScalar,
+  field: Pick<RecordField, "valueType" | "multiple" | "options">,
+): CustomErrorCode | null {
+  if (!scalarMatchesType(value, field.valueType, field.multiple))
+    return TYPE_MISMATCH_CODES[field.valueType] ?? CustomErrorCode.recordValueTypeMismatch;
+  if (!selectedOptionIds(value).every((id) => field.options.some((option) => option.id === id)))
+    return CustomErrorCode.recordOptionInvalid;
+  return null;
+}
+
+export function recordValueIssueValues(
+  issue: CustomErrorCode,
+  value: RecordScalar,
+  field: Pick<RecordField, "id" | "label" | "options">,
+): Record<string, string> | undefined {
+  if (issue !== CustomErrorCode.recordOptionInvalid) return undefined;
+  const unknown = selectedOptionIds(value).find((id) => !field.options.some((option) => option.id === id));
+  return {
+    field: field.label,
+    fieldId: field.id,
+    value: unknown ?? (value.kind === "text" ? value.value : ""),
+    validValues: field.options.map((option) => `${option.id} (${option.label})`).join(", "),
+  };
+}
+
+export function expressionFieldDependencies(expression: CalculationExpression): Set<string> {
+  if (expression.kind === "field" || expression.kind === "optionAttribute") return new Set([expression.fieldId]);
+  if (expression.kind === "related") return expressionFieldDependencies(expression.expression);
+  if (expression.kind === "operation")
+    return new Set(expression.arguments.flatMap((argument) => [...expressionFieldDependencies(argument)]));
+  return new Set();
+}
+
+export function expressionRelationshipDependencies(expression: CalculationExpression): Set<string> {
+  if (expression.kind === "related")
+    return new Set([expression.relationId, ...expressionRelationshipDependencies(expression.expression)]);
+  if (expression.kind === "operation")
+    return new Set(expression.arguments.flatMap((argument) => [...expressionRelationshipDependencies(argument)]));
+  return new Set();
+}
+
+function primitiveType(value: RecordScalar | null): RecordValueType | null {
+  if (!value) return null;
+  if (value.kind === "decimal") return value.currency ? "currency" : "number";
+  if (value.kind === "range") return "dateRange";
+  if (value.kind === "textList") return "text";
+  if (value.kind === "selectList") return null;
+  return value.kind;
+}
+
+function normalizeType(value: RecordValueType | null): RecordValueType | null {
+  return value === "url" ? "text" : value;
+}
+
+type CalculationInputField = Pick<RecordField, "id" | "typeId" | "archived" | "valueType" | "multiple" | "options">;
+
+function inferExpressionType(
+  expression: CalculationExpression,
+  typeId: string,
+  fields: ReadonlyMap<string, CalculationInputField>,
+  relations: ReadonlyMap<string, RecordModel["relationships"][number]>,
+  report: (code: string) => void,
+): RecordValueType | null {
+  const invalid = (code: string) => {
+    report(code);
+    return null;
+  };
+  const expressionType = (child: CalculationExpression, childTypeId: string) =>
+    inferExpressionType(child, childTypeId, fields, relations, report);
+  if (expression.kind === "literal") {
+    if (expression.value?.kind === "file") return invalid("file_not_calculable");
+    if (expression.value?.kind === "address") return invalid("address_not_calculable");
+    return primitiveType(expression.value);
+  }
+  if (expression.kind === "field" || expression.kind === "optionAttribute") {
+    const field = fields.get(expression.fieldId);
+    if (!field || field.archived || field.typeId !== typeId) return invalid("invalid_field_reference");
+    if (field.valueType === "select" && field.multiple) return invalid("multiple_choice_not_calculable");
+    if (field.valueType === "channels") return invalid("channels_not_calculable");
+    if (field.valueType === "file") return invalid("file_not_calculable");
+    if (expression.kind === "field") return normalizeType(field.valueType);
+    if (field.valueType !== "select") return invalid("option_attribute_requires_select");
+    const attributeTypes = new Set(
+      field.options.flatMap((option) =>
+        option.attributes
+          .filter((attribute) => attribute.key === expression.attribute)
+          .map((attribute) => primitiveType(attribute.value)),
+      ),
+    );
+    if (attributeTypes.has("file")) return invalid("file_not_calculable");
+    if (attributeTypes.has("address")) return invalid("address_not_calculable");
+    if (attributeTypes.size > 1) return invalid("option_attribute_type_mismatch");
+    return [...attributeTypes][0] ?? null;
+  }
+  if (expression.kind === "related") {
+    const relation = relations.get(expression.relationId);
+    if (!relation || relation.archived) return invalid("invalid_relationship_reference");
+    const outgoing = expression.direction === "outgoing";
+    if ((outgoing ? relation.sourceTypeId : relation.targetTypeId) !== typeId)
+      return invalid("invalid_relationship_direction");
+    if (expression.reducer === "one" && (outgoing ? relation.sourceCardinality : relation.targetCardinality) !== "one")
+      return invalid("lookup_requires_singular_relationship");
+    const result = expressionType(expression.expression, outgoing ? relation.targetTypeId : relation.sourceTypeId);
+    if (expression.reducer === "count") return "number";
+    if (["sum", "average"].includes(expression.reducer) && result && !["number", "currency"].includes(result))
+      return invalid("numeric_aggregation_required");
+    if (result === "address" && expression.reducer !== "one") return invalid("address_not_calculable");
+    return result;
+  }
+  const args = expression.arguments.map((argument) => expressionType(argument, typeId));
+  const operator = expression.operator;
+  const required =
+    operator === "if"
+      ? 3
+      : ["not", "lower", "upper", "trim"].includes(operator)
+        ? 1
+        : ["coalesce", "concat", "and", "or"].includes(operator)
+          ? null
+          : 2;
+  if ((required !== null && args.length !== required) || args.length === 0) return invalid("invalid_argument_count");
+  if (args.includes("address") && operator !== "if" && operator !== "coalesce")
+    return invalid("address_not_calculable");
+  if (operator === "if") {
+    if (args[0] !== "boolean" || (args[1] && args[2] && args[1] !== args[2]))
+      return invalid("conditional_type_mismatch");
+    return args[1] ?? args[2];
+  }
+  if (operator === "coalesce") {
+    const concrete = new Set(args.filter(Boolean));
+    if (concrete.size > 1) return invalid("coalesce_type_mismatch");
+    return args.find(Boolean) ?? null;
+  }
+  if (["equal", "lessThan", "greaterThan"].includes(operator)) {
+    if (args[0] && args[1] && args[0] !== args[1]) return invalid("comparison_type_mismatch");
+    return "boolean";
+  }
+  if (["and", "or", "not"].includes(operator)) {
+    if (args.some((type) => type && type !== "boolean")) return invalid("boolean_argument_required");
+    return "boolean";
+  }
+  if (["concat", "lower", "upper", "trim"].includes(operator)) {
+    if (args.some((type) => type && type !== "text")) return invalid("text_argument_required");
+    return "text";
+  }
+  if (operator === "daysBetween") {
+    if (
+      args.some((type) => type && !["date", "dateTime"].includes(type)) ||
+      (args[0] && args[1] && args[0] !== args[1])
+    )
+      return invalid("date_argument_required");
+    return "number";
+  }
+  if (args.some((type) => type && !["number", "currency"].includes(type))) return invalid("numeric_argument_required");
+  if ((operator === "add" || operator === "subtract") && args[0] && args[1] && args[0] !== args[1])
+    return invalid("currency_type_mismatch");
+  if (operator === "multiply" && args.every((type) => type === "currency")) return invalid("currency_type_mismatch");
+  if (operator === "divide" && args[1] === "currency")
+    return args[0] === "currency" ? "number" : invalid("currency_type_mismatch");
+  return args.includes("currency") ? "currency" : "number";
+}
+
+export function calculationExpressionIssues(
+  expression: CalculationExpression,
+  typeId: string,
+  model: { fields: CalculationInputField[]; relationships: RecordModel["relationships"] },
+): { resultType: RecordValueType | null; issues: string[] } {
+  const issues: string[] = [];
+  const resultType = inferExpressionType(
+    expression,
+    typeId,
+    new Map(model.fields.map((field) => [field.id, field])),
+    new Map(model.relationships.map((relation) => [relation.id, relation])),
+    (code) => issues.push(code),
+  );
+  return { resultType, issues };
+}
+
+export function calculationResultType(
+  expression: CalculationExpression,
+  typeId: string,
+  model: { fields: CalculationInputField[]; relationships: RecordModel["relationships"] },
+): RecordValueType | null {
+  return calculationExpressionIssues(expression, typeId, model).resultType;
+}
+
+export function validateRecordModel(model: RecordModel): {
+  issues: ModelIssue[];
+  calculationOrder: string[];
+} {
+  const issues: ModelIssue[] = [];
+  const types = new Map(model.types.map((type) => [type.id, type]));
+  const fields = new Map(model.fields.map((field) => [field.id, field]));
+  const relations = new Map(model.relationships.map((relation) => [relation.id, relation]));
+  if (
+    types.size !== model.types.length ||
+    fields.size !== model.fields.length ||
+    relations.size !== model.relationships.length
+  )
+    issues.push({ code: "duplicate_definition_id" });
+
+  const expressionType = (expression: CalculationExpression, typeId: string, owner: RecordField) =>
+    inferExpressionType(expression, typeId, fields, relations, (code) => issues.push({ code, fieldId: owner.id }));
+
+  for (const type of model.types) {
+    const paths = type.relationshipPaths ?? [];
+    if (new Set(paths.map((path) => path.id)).size !== paths.length)
+      issues.push({ code: "duplicate_definition_id", typeId: type.id });
+    if (type.archived) continue;
+    for (const path of paths) {
+      if (path.archived) continue;
+      const steps = resolveRecordPath(type.id, path.path, model);
+      if (!steps || steps.some((step) => !types.has(step.typeId) || types.get(step.typeId)?.archived))
+        issues.push({ code: "invalid_relationship_path", typeId: type.id });
+    }
+    const primary = type.primaryFieldId ? fields.get(type.primaryFieldId) : null;
+    if (
+      type.primaryFieldId &&
+      (!primary || primary.typeId !== type.id || primary.archived || primary.valueType !== "text")
+    )
+      issues.push({ code: "invalid_primary_field", typeId: type.id, ...(primary ? { fieldId: primary.id } : {}) });
+  }
+  for (const type of model.types) {
+    if (type.archived) continue;
+    const visited = new Set<string>();
+    let current = type;
+    while (current.parentRelationshipId) {
+      if (visited.has(current.id) || visited.size >= 12) {
+        issues.push({ code: "parent_access_cycle_or_depth", typeId: type.id });
+        break;
+      }
+      visited.add(current.id);
+      const relation = relations.get(current.parentRelationshipId);
+      const parent = relation && types.get(relation.targetTypeId);
+      if (
+        !relation ||
+        relation.archived ||
+        relation.sourceTypeId !== current.id ||
+        relation.sourceCardinality !== "one" ||
+        !parent ||
+        parent.archived ||
+        relation.onTargetDelete === "unlink"
+      ) {
+        issues.push({
+          code: "invalid_parent_relationship",
+          typeId: type.id,
+          relationId: current.parentRelationshipId,
+        });
+        break;
+      }
+      current = parent;
+    }
+  }
+  for (const relation of model.relationships) {
+    if (!types.has(relation.sourceTypeId) || !types.has(relation.targetTypeId)) {
+      issues.push({
+        code: "invalid_relationship_type",
+        relationId: relation.id,
+      });
+    }
+    if (
+      !relation.archived &&
+      (types.get(relation.sourceTypeId)?.archived || types.get(relation.targetTypeId)?.archived)
+    ) {
+      issues.push({
+        code: "archived_relationship_type",
+        relationId: relation.id,
+      });
+    }
+  }
+  for (const preset of model.accessPresets) {
+    if (new Set(preset.grants.map((grant) => grant.roleId)).size !== preset.grants.length)
+      issues.push({ code: "duplicate_grant_role" });
+  }
+
+  for (const binding of model.capabilities) {
+    const type = types.get(binding.typeId);
+    if (!type) issues.push({ code: "capability_requires_type", typeId: binding.typeId });
+    if (new Set(binding.fields.map((field) => field.role)).size !== binding.fields.length) {
+      issues.push({
+        code: "duplicate_capability_role",
+        typeId: binding.typeId,
+      });
+    }
+    for (const reference of binding.fields) {
+      const field = fields.get(reference.fieldId);
+      const expectedType = binding.kind === "avatar" ? "url" : "dateTimeRange";
+      if (!field || field.archived || field.typeId !== binding.typeId || field.valueType !== expectedType) {
+        issues.push({
+          code: "capability_requires_field",
+          fieldId: reference.fieldId,
+        });
+      }
+    }
+  }
+  for (const field of model.fields) {
+    if (field.multiple && !MULTIPLE_VALUE_TYPES.includes(field.valueType))
+      issues.push({ code: "invalid_multiple_value_type", fieldId: field.id });
+    if (field.valueType === "select" && field.multiple && field.behavior.kind !== "input")
+      issues.push({ code: "multiple_choice_requires_input", fieldId: field.id });
+    if (!types.has(field.typeId)) issues.push({ code: "invalid_field_type", fieldId: field.id });
+    if (new Set(field.options.map((option) => option.id)).size !== field.options.length)
+      issues.push({ code: "duplicate_option_id", fieldId: field.id });
+    const attributeKinds = new Set(
+      field.options.flatMap((option) => option.attributes.map((attribute) => attribute.value.kind)),
+    );
+    if (attributeKinds.has("file")) issues.push({ code: "file_not_calculable", fieldId: field.id });
+    if (attributeKinds.has("address")) issues.push({ code: "address_not_calculable", fieldId: field.id });
+    if (field.valueType === "currency" && !field.format?.currency)
+      issues.push({ code: "missing_currency", fieldId: field.id });
+    if (field.format?.onClick && !CLICK_ACTION_VALUE_TYPES.includes(field.valueType))
+      issues.push({ code: "invalid_click_action", fieldId: field.id });
+    if (
+      field.valueType === "file" &&
+      (field.behavior.kind !== "input" || field.behavior.defaultValue || field.options.length)
+    )
+      issues.push({ code: "invalid_file_field", fieldId: field.id });
+    if (
+      field.valueType === "address" &&
+      ((field.behavior.kind === "input" && field.behavior.defaultValue) ||
+        field.behavior.kind === "formula" ||
+        field.behavior.kind === "rollup" ||
+        field.options.length)
+    )
+      issues.push({ code: "invalid_address_field", fieldId: field.id });
+    if (field.format?.providerAvatar !== undefined && field.valueType !== "channels")
+      issues.push({ code: "invalid_provider_avatar", fieldId: field.id });
+    if (field.valueType === "channels") {
+      if (
+        field.behavior.kind !== "input" ||
+        field.behavior.defaultValue ||
+        field.required ||
+        field.multiple ||
+        field.options.length
+      )
+        issues.push({ code: "invalid_channels_field", fieldId: field.id });
+      if (
+        model.fields.some(
+          (other) => other.valueType === "channels" && other.typeId === field.typeId && other.id < field.id,
+        )
+      )
+        issues.push({ code: "duplicate_channels_field", typeId: field.typeId, fieldId: field.id });
+    }
+    if (field.behavior.kind === "input") {
+      if (
+        field.behavior.defaultValue &&
+        (!scalarMatchesType(field.behavior.defaultValue, field.valueType, field.multiple) ||
+          !selectedOptionIds(field.behavior.defaultValue).every((id) =>
+            field.options.some((option) => option.id === id),
+          ))
+      )
+        issues.push({ code: "invalid_default", fieldId: field.id });
+      continue;
+    }
+    if (field.archived || types.get(field.typeId)?.archived) continue;
+    if (field.behavior.kind === "snapshot" && field.behavior.capture === "whenChanged") {
+      const trigger = fields.get(field.behavior.triggerFieldId ?? "");
+      if (
+        !trigger ||
+        trigger.typeId !== field.typeId ||
+        trigger.archived ||
+        trigger.behavior.kind !== "input" ||
+        trigger.multiple ||
+        trigger.valueType === "file" ||
+        trigger.valueType === "address" ||
+        !field.behavior.triggerValue ||
+        !scalarMatchesType(field.behavior.triggerValue, trigger.valueType)
+      )
+        issues.push({ code: "invalid_snapshot_trigger", fieldId: field.id });
+    }
+    const inferred = expressionType(field.behavior.expression, field.typeId, field);
+    if (inferred && inferred !== normalizeType(field.valueType)) {
+      issues.push({
+        code: "calculation_result_type_mismatch",
+        fieldId: field.id,
+      });
+    }
+  }
+  const calculationOrder: string[] = [];
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+  const visit = (id: string, depth = 0) => {
+    if (depth > 64) {
+      issues.push({ code: "calculation_dependency_depth", fieldId: id });
+      return;
+    }
+    if (visiting.has(id)) {
+      issues.push({ code: "calculation_cycle", fieldId: id });
+      return;
+    }
+    if (visited.has(id)) return;
+    const field = fields.get(id);
+    if (!field || field.archived || field.behavior.kind === "input") return;
+    visiting.add(id);
+    for (const dependency of expressionFieldDependencies(field.behavior.expression)) visit(dependency, depth + 1);
+    visiting.delete(id);
+    visited.add(id);
+    calculationOrder.push(id);
+  };
+  for (const field of model.fields) visit(field.id);
+  return { issues, calculationOrder };
+}
