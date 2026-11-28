@@ -1,0 +1,168 @@
+import { manageRolesTool } from "@/features/mcp-tools/role.mcp-tools";
+import { manageDataViewsTool } from "@/features/mcp-tools/data-view.mcp-tools";
+import { manageCalendarTool } from "@/features/mcp-tools/planner.mcp-tools";
+import { manageTrashTool, readTrashTool } from "@/features/mcp-tools/trash.mcp-tools";
+import {
+  discoverRecordTypesV2Tool,
+  getRecordModelV2Tool,
+  configureRecordModelV2Tool,
+  queryRecordsV2Tool,
+  searchRecordsV2Tool,
+  resolveRecordIdentifiersV2Tool,
+  readRecordV2Tool,
+  mutateRecordV2Tool,
+  previewRecordDeletionV2Tool,
+  queryRecordMeasureV2Tool,
+  readRecordOperationV2Tool,
+  cancelRecordOperationV2Tool,
+  resumeRecordOperationV2Tool,
+  manageRecordDetailLayoutV2Tool,
+} from "@/features/mcp-tools/record-model.mcp-tools";
+import { getDocsPageTool, searchDocsTool } from "@/features/mcp-tools/docs.mcp-tools";
+import { getWorkspaceContextTool, listUsersTool } from "@/features/mcp-tools/workspace.mcp-tools";
+import { fetchTool, searchTool } from "@/features/mcp-tools/deep-research.mcp-tools";
+import { checkAddressTool, lookupAddressTool } from "@/features/mcp-tools/address.mcp-tools";
+import { manageTeamTool, updateMyProfileTool } from "@/features/mcp-tools/admin.mcp-tools";
+import { manageWebhooksTool } from "@/features/mcp-tools/webhook.mcp-tools";
+import { manageWidgetsTool } from "@/features/mcp-tools/widget.mcp-tools";
+import { manageRoutinesTool } from "@/features/mcp-tools/routine.mcp-tools";
+import { requestSupportTool } from "@/features/mcp-tools/support.mcp-tools";
+import { getOperatorUsageTool } from "@/features/mcp-tools/operator.mcp-tools";
+import { manageWikiPagesTool } from "@/features/mcp-tools/wiki.mcp-tools";
+import { exportCrmRecordsTool, importCrmRecordsTool } from "@/features/mcp-tools/data-transfer.mcp-tools";
+import { manageRecordFilesTool } from "@/features/mcp-tools/record-file.mcp-tools";
+import { manageConnectedAccountsTool } from "@/features/mcp-tools/connected-account.mcp-tools";
+import {
+  connectMessagingAccountTool,
+  discardMessageDraftTool,
+  getActivitiesTool,
+  getCalendarsTool,
+  getMessagingThreadsTool,
+  saveMessageDraftTool,
+  sendChatMessageTool,
+  sendEmailTool,
+  updateMessagingThreadTool,
+  moveEmailThreadTool,
+  manageConversationRecordsTool,
+} from "@/features/mcp-tools/messaging.mcp-tools";
+import {
+  getSocialPostEngagementTool,
+  getSocialPostsTool,
+  getSocialProfileTool,
+  manageSocialRelationsTool,
+} from "@/features/mcp-tools/social-posts.mcp-tools";
+import {
+  getSalesSearchParametersTool,
+  manageSalesListsTool,
+  searchSalesCompaniesTool,
+  searchSalesLeadsTool,
+} from "@/features/mcp-tools/sales-navigator.mcp-tools";
+
+import type { McpTool } from "@/features/mcp-tools/mcp-tool";
+import type { AppMode } from "@/core/config/environment";
+
+import { env } from "@/env";
+
+export const MCP_TOOL_GROUPS: Record<string, McpTool[]> = {
+  records: [
+    discoverRecordTypesV2Tool,
+    getRecordModelV2Tool,
+    queryRecordsV2Tool,
+    searchRecordsV2Tool,
+    resolveRecordIdentifiersV2Tool,
+    lookupAddressTool,
+    checkAddressTool,
+    readRecordV2Tool,
+    mutateRecordV2Tool,
+    previewRecordDeletionV2Tool,
+    queryRecordMeasureV2Tool,
+    readRecordOperationV2Tool,
+    cancelRecordOperationV2Tool,
+    resumeRecordOperationV2Tool,
+    readTrashTool,
+    manageTrashTool,
+    exportCrmRecordsTool,
+    importCrmRecordsTool,
+    manageRecordFilesTool,
+  ],
+  "record-model": [configureRecordModelV2Tool],
+  workspace: [getWorkspaceContextTool, listUsersTool],
+  views: [manageDataViewsTool, manageRecordDetailLayoutV2Tool, manageCalendarTool],
+  wiki: [manageWikiPagesTool],
+  messaging: [
+    getMessagingThreadsTool,
+    getActivitiesTool,
+    getCalendarsTool,
+    sendChatMessageTool,
+    sendEmailTool,
+    saveMessageDraftTool,
+    discardMessageDraftTool,
+    updateMessagingThreadTool,
+    moveEmailThreadTool,
+    manageConversationRecordsTool,
+    connectMessagingAccountTool,
+    manageConnectedAccountsTool,
+  ],
+  social: [
+    getSocialPostsTool,
+    getSocialPostEngagementTool,
+    getSocialProfileTool,
+    manageSocialRelationsTool,
+    searchSalesLeadsTool,
+    searchSalesCompaniesTool,
+    getSalesSearchParametersTool,
+    manageSalesListsTool,
+  ],
+  docs: [searchDocsTool, getDocsPageTool],
+  widgets: [manageWidgetsTool],
+  routines: [manageRoutinesTool],
+  webhooks: [manageWebhooksTool],
+  admin: [updateMyProfileTool, manageTeamTool, manageRolesTool],
+  support: [requestSupportTool],
+};
+
+export const MCP_ALWAYS_ON_TOOLS: McpTool[] = [searchTool, fetchTool];
+
+export const MCP_OPERATOR_TOOLS: McpTool[] = [getOperatorUsageTool];
+
+const CLOUD_ONLY_MCP_TOOLS: ReadonlySet<McpTool> = new Set([
+  ...MCP_TOOL_GROUPS.messaging.filter((tool) => tool !== getActivitiesTool),
+  ...MCP_TOOL_GROUPS.social,
+  ...MCP_TOOL_GROUPS.routines,
+]);
+
+function isMcpToolOffered(tool: McpTool, appMode: AppMode): boolean {
+  if (appMode === "self-hosted" && CLOUD_ONLY_MCP_TOOLS.has(tool)) return false;
+  return tool !== lookupAddressTool || Boolean(env.ADDRESS_LOOKUP_URL);
+}
+
+export function mcpToolGroupsForAppMode(appMode: AppMode): Record<string, McpTool[]> {
+  return Object.fromEntries(
+    Object.entries(MCP_TOOL_GROUPS).map(([key, tools]) => [
+      key,
+      tools.filter((tool) => isMcpToolOffered(tool, appMode)),
+    ]),
+  );
+}
+
+export const ALL_MCP_TOOLS = [...Object.values(MCP_TOOL_GROUPS).flat(), ...MCP_ALWAYS_ON_TOOLS];
+
+export const ALL_MCP_TOOLS_WITH_OPERATOR = [...ALL_MCP_TOOLS, ...MCP_OPERATOR_TOOLS];
+
+export function countMcpTools(tools: readonly Pick<McpTool, "name">[] = ALL_MCP_TOOLS): number {
+  const names = tools.map((tool) => tool.name);
+  const duplicateNames = names.filter((name, index) => names.indexOf(name) !== index);
+
+  if (duplicateNames.length > 0)
+    throw new Error(`Duplicate MCP tool names: ${[...new Set(duplicateNames)].join(", ")}`);
+
+  return names.length;
+}
+
+export const MCP_TOOL_COUNT = countMcpTools();
+
+export function offeredMcpToolCount(appMode: AppMode): number {
+  return countMcpTools([...Object.values(mcpToolGroupsForAppMode(appMode)).flat(), ...MCP_ALWAYS_ON_TOOLS]);
+}
+export const MCP_GROUPED_TOOL_COUNT = Object.values(MCP_TOOL_GROUPS).flat().length;
+export const MCP_TOOLSET_COUNT = Object.keys(MCP_TOOL_GROUPS).length;
